@@ -1,0 +1,26 @@
+# Jupyter notebook checkpoints - ignore checkpoint files    
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment directories
+venv/
+env/
+.venv/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Large data files
+data/
+*.csv
+*.xlsx
+*.h5
+*.db
+*.zip
