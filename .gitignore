@@ -24,3 +24,6 @@ data/
 *.h5
 *.db
 *.zip
+
+# Analysis results (private trading data)
+data/analysis_results/*
