@@ -1,0 +1,4 @@
+# Bitcoin Trading Sentiment Analyzer Dependencies
+requests>=2.31.0
+feedparser>=6.0.10
+ccxt>=4.0.0
