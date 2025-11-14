@@ -26,5 +26,6 @@ data/
 *.zip
 
 # Analysis results (private trading data)
-data/analysis_results/*scripts/test_cases.json
+data/analysis_results/*
+scripts/test_cases.json
 .vscode/
