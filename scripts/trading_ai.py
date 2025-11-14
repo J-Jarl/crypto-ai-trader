@@ -6,7 +6,8 @@ Uses Ollama with qwen3-coder:30b model to analyze news and make trading recommen
 import json
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
+import time
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 import feedparser
@@ -64,6 +65,37 @@ class MarketData:
     exchange_error: Optional[str] = None
     fear_greed_available: bool = False
     fear_greed_error: Optional[str] = None
+
+
+def format_relative_time(timestamp_struct) -> str:
+    """Format a time.struct_time as relative time (e.g., '2 hours ago')"""
+    if not timestamp_struct:
+        return "Unknown time"
+
+    try:
+        published_time = time.mktime(timestamp_struct)
+        now = time.time()
+        diff_seconds = now - published_time
+
+        if diff_seconds < 0:
+            return "Just now"
+        elif diff_seconds < 60:
+            return "Just now"
+        elif diff_seconds < 3600:
+            minutes = int(diff_seconds / 60)
+            return f"{minutes} {'minute' if minutes == 1 else 'minutes'} ago"
+        elif diff_seconds < 86400:
+            hours = int(diff_seconds / 3600)
+            return f"{hours} {'hour' if hours == 1 else 'hours'} ago"
+        elif diff_seconds < 604800:
+            days = int(diff_seconds / 86400)
+            return f"{days} {'day' if days == 1 else 'days'} ago"
+        else:
+            # Format as date if more than a week old
+            dt = datetime.fromtimestamp(published_time)
+            return dt.strftime("%b %d, %I:%M %p")
+    except Exception:
+        return "Unknown time"
 
 
 class OllamaClient:
@@ -410,28 +442,62 @@ class BitcoinNewsAggregator:
             reverse=True
         )
 
-        # Remove the temporary timestamp attribute
-        for article in all_articles:
-            if hasattr(article, '_timestamp'):
-                delattr(article, '_timestamp')
-
-        # Return the most recent articles
+        # Return the most recent articles (keep _timestamp for display)
         return all_articles[:max_articles]
 
     def _is_bitcoin_related(self, title: str, description: str) -> bool:
-        """Check if article is Bitcoin-related"""
-        # Convert to lowercase for case-insensitive matching
+        """
+        Check if article is primarily about Bitcoin (not just mentioned in passing).
+        Strict filtering to exclude articles primarily about other cryptocurrencies.
+        """
         title_lower = title.lower()
         description_lower = description.lower()
 
-        # Check if title or description contains Bitcoin or BTC
+        # List of altcoin tickers to exclude (if they appear in title, article is likely about them)
+        altcoin_tickers = [
+            'xrp', 'eth', 'ethereum', 'sol', 'solana', 'ada', 'cardano',
+            'doge', 'dogecoin', 'bnb', 'binance', 'avax', 'avalanche',
+            'dot', 'polkadot', 'matic', 'polygon', 'link', 'chainlink',
+            'atom', 'cosmos', 'xlm', 'stellar', 'algo', 'algorand',
+            'shib', 'shiba', 'uni', 'uniswap', 'ltc', 'litecoin',
+            'popcat', 'pepe', 'bonk', 'floki', 'usdt', 'tether',
+            'usdc', 'dai', 'busd'
+        ]
+
+        # If title contains altcoin ticker, exclude it (title indicates primary topic)
+        # Even if Bitcoin is mentioned, multi-coin articles are not Bitcoin-focused
+        for altcoin in altcoin_tickers:
+            # Check for whole word match to avoid false positives
+            if f' {altcoin} ' in f' {title_lower} ' or title_lower.startswith(f'{altcoin} ') or title_lower.endswith(f' {altcoin}'):
+                # Exception: if this is a comma-separated list and Bitcoin is clearly first/primary
+                # Skip articles that mention Bitcoin alongside other coins (e.g., "Bitcoin, XRP, and ETH fall")
+                return False
+            # Also check for ticker format like "ETH, SOL, ADA"
+            if f'{altcoin},' in title_lower or f', {altcoin}' in title_lower:
+                return False
+
+        # Bitcoin must be mentioned in title OR description
         bitcoin_keywords = ["bitcoin", "btc"]
+        has_bitcoin = any(keyword in title_lower or keyword in description_lower for keyword in bitcoin_keywords)
 
-        for keyword in bitcoin_keywords:
-            if keyword in title_lower or keyword in description_lower:
-                return True
+        if not has_bitcoin:
+            return False
 
-        return False
+        # For stronger filtering: prefer articles with Bitcoin/BTC in the TITLE
+        # Articles with Bitcoin only in description are often about other topics
+        has_bitcoin_in_title = any(keyword in title_lower for keyword in bitcoin_keywords)
+
+        # If Bitcoin is only in description (not title), be more skeptical
+        if not has_bitcoin_in_title:
+            # Check if description talks about multiple coins (likely general crypto news)
+            multi_coin_indicators = ['crypto', 'altcoin', 'tokens', 'coins']
+            if any(indicator in description_lower for indicator in multi_coin_indicators):
+                # Only accept if Bitcoin is mentioned prominently (at start of description)
+                description_start = description_lower[:100]
+                if not any(keyword in description_start for keyword in bitcoin_keywords):
+                    return False
+
+        return True
 
 
 class BitcoinSentimentAnalyzer:
@@ -790,6 +856,9 @@ class BitcoinTradingBot:
             print("Recent Headlines:")
             for i, article in enumerate(articles, 1):
                 print(f"  {i}. {article.title[:80]}{'...' if len(article.title) > 80 else ''}")
+                # Show publication time and source
+                time_str = format_relative_time(getattr(article, '_timestamp', None))
+                print(f"     Published {time_str} | Source: {article.source}")
             print()
 
         # Analyze sentiment
