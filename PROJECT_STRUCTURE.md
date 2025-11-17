@@ -260,7 +260,24 @@ ccxt                    # Cryptocurrency exchange data
 - **Location**: `C:\Apps\Obsidian\Jarl\crypto-ai-trader`
 - **Backup**: `Automatically synced to NAS via Synology Drive`
 
-## System Architecture
+## Setup & Migration History
+
+### November 16, 2025 - Project Migration & Conda Environment Setup
+**Major Changes:**
+- Migrated entire project from `C:\Users\JarlJ\Documents\Projects\crypto-ai-trader` to `C:\Apps\Obsidian\Jarl\crypto-ai-trader`
+- Project now automatically syncs to NAS via Synology Drive for backup
+- Created dedicated conda environment `crypto-ai-trader` with Python 3.13.9
+- Installed project dependencies: requests (2.32.5), feedparser (6.0.12), ccxt (4.5.19)
+- Verified Git repository integrity at new location - all history preserved
+- Tested trading_ai.py successfully - system fully functional
+- Updated all documentation paths to reflect new location
+- Updated conda from version 25.5.1 to 25.9.1
+
+**Environment Details:**
+- Conda Environment: `crypto-ai-trader`
+- Location: `C:\Users\JarlJ\anaconda3\envs\crypto-ai-trader`
+- Python Version: 3.13.9
+- Activation: `conda activate crypto-ai-trader`
 
 ### Data Flow
 ```
