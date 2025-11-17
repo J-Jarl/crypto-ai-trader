@@ -185,6 +185,16 @@ secrets/
 - **Git** for version control
 - **VS Code** with Claude Code extension
 - **GitHub** for remote repository
+                                                                                                                                                                                                      
+### Python Environment
+- **Conda Environment**: `crypto-ai-trader`
+- **Python Version**: 3.13.9
+- **Environment Location**: `C:\Users\JarlJ\anaconda3\envs\crypto-ai-trader`
+
+To activate the environment:
+```bash
+conda activate crypto-ai-trader
+```
 
 ### Key Python Libraries
 ```txt
@@ -197,13 +207,14 @@ ccxt                    # Cryptocurrency exchange data
 
 1. **Clone Repository**
    ```bash
-   cd ~/Documents/projects
+   cd /Apps/Obsidian/Jarl
    git clone https://github.com/J-Jarl/crypto-ai-trader.git
    cd crypto-ai-trader
    ```
 
 2. **Install Dependencies**
-   ```bash
+   ```bash                                                                                                                                                                                          
+   conda activate crypto-ai-trader
    pip install -r requirements.txt
    ```
 
@@ -246,7 +257,8 @@ ccxt                    # Cryptocurrency exchange data
 
 - **URL**: `https://github.com/J-Jarl/crypto-ai-trader`
 - **Primary Branch**: `main`
-- **Location**: `C:\Users\JarlJ\Documents\projects\crypto-ai-trader`
+- **Location**: `C:\Apps\Obsidian\Jarl\crypto-ai-trader`
+- **Backup**: `Automatically synced to NAS via Synology Drive`
 
 ## System Architecture
 
