@@ -273,6 +273,26 @@ ccxt                    # Cryptocurrency exchange data
 - Updated all documentation paths to reflect new location
 - Updated conda from version 25.5.1 to 25.9.1
 
+### November 18, 2025 - AI-Assisted Development Environment
+**Aider Configuration:**
+- Installed Aider 0.86.1 via UV (global installation using aider-install)
+- Configured `.aider.conf.yml` for qwen3-coder:30b via local Ollama (http://localhost:11434)
+- Enabled auto-commits with project context awareness (README.md, PROJECT_STRUCTURE.md)
+- Added architect mode setting for complex refactoring (Phase 3+)
+- Configured test-cmd placeholder for evaluation framework (Phase 2)
+- Set map-tokens: 2048 for codebase structure understanding
+
+**Terminal Setup:**
+- Configured Windows Terminal with Git Bash as default shell
+- Starting directory: `C:\Apps\Obsidian\Jarl`
+- Created workflow alias: `trade-ai` navigates to project and activates conda environment
+- From project directory, simply run `aider` to start AI-assisted coding
+
+**Architecture Decision:**
+- Global Aider installation (not environment-specific) works with active conda environment
+- One comprehensive conda environment per project (not micro-environments)
+- Conda chosen over venv for future AI/ML work (PyTorch, Phase 5 model fine-tuning)
+
 **Environment Details:**
 - Conda Environment: `crypto-ai-trader`
 - Location: `C:\Users\JarlJ\anaconda3\envs\crypto-ai-trader`
@@ -362,6 +382,6 @@ ccxt                    # Cryptocurrency exchange data
 
 ---
 
-**Last Updated**: November 13, 2025  
-**Maintained By**: J-Jarl  
+**Last Updated**: November 18, 2025
+**Maintained By**: J-Jarl
 **Project Status**: Active Development - Phase 2 (Evaluation)
