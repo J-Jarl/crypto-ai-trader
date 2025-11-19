@@ -29,3 +29,9 @@ data/
 data/analysis_results/*
 scripts/test_cases.json
 .vscode/
+
+# Aider temporary files and caches
+.aider.chat.history*
+.aider.input.history
+.aider.tags.cache.v3/
+.aider.msg.md
