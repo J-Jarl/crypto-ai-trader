@@ -1,0 +1,38 @@
+# Aider configuration for crypto-ai-trader project
+
+# Models - Local Ollama with Qwen3-coder (30B parameters)
+model: ollama/qwen3-coder:30b
+editor-model: ollama/qwen3-coder:30b
+openai-api-base: http://localhost:11434/v1
+
+# Git integration
+auto-commits: true              # Auto-commit changes
+dirty-commits: true             # Allow working with uncommitted changes
+attribute-author: false         # Don't mark commits as AI-generated
+attribute-committer: false      # Keep clean commit metadata
+
+# Code editing preferences
+edit-format: whole              # Show complete files, not just diffs
+show-diffs: true               # Display changes before committing
+
+# Performance
+auto-lint: false               # Skip auto-linting (avoid slowdowns)
+
+# Project context - files Aider should always be aware of
+read: README.md, PROJECT_STRUCTURE.md
+
+# Testing integration (uncomment when you have tests)
+# test-cmd: "python scripts/evaluation_framework.py --quick-test"
+
+# Message formatting
+message-file: .aider.msg.md    # Save commit messages for review
+
+# UI preferences
+pretty: true                   # Fancy formatted output
+no-fancy-input: false         # Keep autocomplete and suggestions
+
+# Architect mode settings (for planning complex changes)
+architect: false              # Use normal mode by default
+
+# Map settings (helps Aider understand project structure)
+map-tokens: 2048             # Dedicate tokens to project map
