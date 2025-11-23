@@ -1086,6 +1086,32 @@ def main():
             json.dump(results, f, indent=2)
         print(f" Results saved to {output_file}")
 
+        # Also save in format expected by evaluation framework
+        evaluation_format = {
+            "timestamp": results["timestamp"],
+            "recommendation": results["recommendation"]["action"].upper(),
+            "confidence_level": results["recommendation"]["confidence"],
+            "sentiment_analysis": {
+                "sentiment": results["sentiment"]["sentiment"],
+                "confidence": results["sentiment"]["confidence"],
+                "key_points": results["sentiment"]["key_points"],
+                "overall_score": results["sentiment"]["confidence"] / 100.0  # Normalize to 0-1 scale
+            },
+            "position_sizing": {
+                "recommended_size": results["position_sizing"]["percentage_of_portfolio"]
+            },
+            "risk_management": {
+                "stop_loss": results["recommendation"]["stop_loss"],
+                "take_profit": results["recommendation"]["take_profit"]
+            }
+        }
+        
+        # Save in evaluation format
+        evaluation_file = os.path.join(output_dir, f"evaluation_format_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        with open(evaluation_file, 'w') as f:
+            json.dump(evaluation_format, f, indent=2)
+        print(f" Evaluation format saved to {evaluation_file}")
+
     except KeyboardInterrupt:
         print("\n\nAnalysis interrupted by user")
     except Exception as e:
