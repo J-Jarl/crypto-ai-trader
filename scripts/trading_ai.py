@@ -884,8 +884,28 @@ class BitcoinTradingBot:
             recommendation, portfolio_value, current_price
         )
 
-        # Prepare results
-        results = {
+        # Prepare results in evaluation framework format
+        evaluation_format = {
+            "timestamp": datetime.now().isoformat(),
+            "recommendation": recommendation.action.upper(),
+            "confidence_level": recommendation.confidence,
+            "sentiment_analysis": {
+                "sentiment": sentiment.sentiment,
+                "confidence": sentiment.confidence,
+                "key_points": sentiment.key_points,
+                "overall_score": sentiment.confidence / 100.0  # Normalize to 0-1 scale
+            },
+            "position_sizing": {
+                "recommended_size": position_details["percentage_of_portfolio"]
+            },
+            "risk_management": {
+                "stop_loss": recommendation.stop_loss,
+                "take_profit": recommendation.take_profit
+            }
+        }
+
+        # Also save the full results for display
+        full_results = {
             "timestamp": datetime.now().isoformat(),
             "analysis_mode": mode,
             "current_price": current_price,
@@ -930,9 +950,25 @@ class BitcoinTradingBot:
         }
 
         # Display results
-        self._display_results(results)
+        self._display_results(full_results)
 
-        return results
+        # Save both formats
+        output_dir = "data/analysis_results"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save full results
+        output_file = os.path.join(output_dir, f"btc_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        with open(output_file, 'w') as f:
+            json.dump(full_results, f, indent=2)
+        print(f" Full results saved to {output_file}")
+
+        # Save evaluation format
+        evaluation_file = os.path.join(output_dir, f"evaluation_format_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        with open(evaluation_file, 'w') as f:
+            json.dump(evaluation_format, f, indent=2)
+        print(f" Evaluation format saved to {evaluation_file}")
+
+        return evaluation_format
 
     def _display_results(self, results: Dict):
         """Display analysis results in a formatted way"""
@@ -1078,39 +1114,8 @@ def main():
             max_articles=10
         )
 
-        # Optionally save results to file
-        output_dir = "data/analysis_results"
-        os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f"btc_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-        with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f" Results saved to {output_file}")
-
-        # Also save in format expected by evaluation framework
-        evaluation_format = {
-            "timestamp": results["timestamp"],
-            "recommendation": results["recommendation"]["action"].upper(),
-            "confidence_level": results["recommendation"]["confidence"],
-            "sentiment_analysis": {
-                "sentiment": results["sentiment"]["sentiment"],
-                "confidence": results["sentiment"]["confidence"],
-                "key_points": results["sentiment"]["key_points"],
-                "overall_score": results["sentiment"]["confidence"] / 100.0  # Normalize to 0-1 scale
-            },
-            "position_sizing": {
-                "recommended_size": results["position_sizing"]["percentage_of_portfolio"]
-            },
-            "risk_management": {
-                "stop_loss": results["recommendation"]["stop_loss"],
-                "take_profit": results["recommendation"]["take_profit"]
-            }
-        }
-        
-        # Save in evaluation format
-        evaluation_file = os.path.join(output_dir, f"evaluation_format_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-        with open(evaluation_file, 'w') as f:
-            json.dump(evaluation_format, f, indent=2)
-        print(f" Evaluation format saved to {evaluation_file}")
+        print("\n✅ Analysis complete!")
+        print(f"Results saved in evaluation format for framework compatibility")
 
     except KeyboardInterrupt:
         print("\n\nAnalysis interrupted by user")
