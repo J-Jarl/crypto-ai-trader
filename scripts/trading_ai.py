@@ -900,7 +900,7 @@ class BitcoinTradingBot:
             "confidence_level": get_confidence_level(recommendation.confidence),
             "sentiment_analysis": {
                 "sentiment": sentiment.sentiment,
-                "confidence": sentiment.confidence,
+                "confidence": sentiment.confidence,  # This should be numeric for evaluation framework
                 "key_points": sentiment.key_points,
                 "overall_score": sentiment.confidence / 100.0  # Normalize to 0-1 scale
             },
