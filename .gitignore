@@ -35,3 +35,5 @@ scripts/test_cases.json
 .aider.input.history
 .aider.tags.cache.v3/
 .aider.msg.md
+.aider.tags.cache.v4/
+.aider*
