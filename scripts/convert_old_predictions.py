@@ -35,9 +35,10 @@ def sentiment_to_score(sentiment: str, confidence: float) -> float:
     Returns:
         Numeric score between -1 and 1
     """
-    if sentiment == 'positive':
+    sentiment_lower = sentiment.lower()
+    if 'bullish' in sentiment_lower or 'positive' in sentiment_lower:
         return confidence / 100.0
-    elif sentiment == 'negative':
+    elif 'bearish' in sentiment_lower or 'negative' in sentiment_lower:
         return -confidence / 100.0
     else:  # neutral
         return 0.0
