@@ -884,11 +884,20 @@ class BitcoinTradingBot:
             recommendation, portfolio_value, current_price
         )
 
+        # Convert numeric confidence to string for evaluation framework
+        def get_confidence_level(confidence: float) -> str:
+            if confidence >= 80:
+                return "HIGH"
+            elif confidence >= 50:
+                return "MEDIUM"
+            else:
+                return "LOW"
+
         # Prepare results in evaluation framework format
         evaluation_format = {
             "timestamp": datetime.now().isoformat(),
             "recommendation": recommendation.action.upper(),  # Ensure uppercase for evaluation framework
-            "confidence_level": recommendation.confidence,
+            "confidence_level": get_confidence_level(recommendation.confidence),
             "sentiment_analysis": {
                 "sentiment": sentiment.sentiment,
                 "confidence": sentiment.confidence,
