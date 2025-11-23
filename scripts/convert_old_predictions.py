@@ -24,6 +24,25 @@ def convert_confidence_to_level(confidence: float) -> str:
         return "LOW"
 
 
+def sentiment_to_score(sentiment: str, confidence: float) -> float:
+    """
+    Convert sentiment string to numeric score
+    
+    Args:
+        sentiment: String representation of sentiment ('positive', 'negative', 'neutral')
+        confidence: Confidence level (0-100)
+        
+    Returns:
+        Numeric score between -1 and 1
+    """
+    if sentiment == 'positive':
+        return confidence / 100.0
+    elif sentiment == 'negative':
+        return -confidence / 100.0
+    else:  # neutral
+        return 0.0
+
+
 def convert_prediction(old_pred: dict) -> dict:
     """Convert old prediction format to new evaluation format"""
     
@@ -37,12 +56,7 @@ def convert_prediction(old_pred: dict) -> dict:
     confidence = sentiment_obj.get('confidence', 50)
     
     # Convert sentiment direction to score
-    if sentiment == 'positive':
-        overall_score = confidence / 100.0
-    elif sentiment == 'negative':
-        overall_score = -confidence / 100.0
-    else:  # neutral
-        overall_score = 0.0
+    overall_score = sentiment_to_score(sentiment, confidence)
     
     # Build new format
     new_pred = {
