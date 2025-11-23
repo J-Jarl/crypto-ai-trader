@@ -32,16 +32,28 @@ def convert_prediction(old_pred: dict) -> dict:
     sentiment_obj = old_pred.get('sentiment', {})
     position_sizing = old_pred.get('position_sizing', {})
     
+    # Extract sentiment direction and confidence
+    sentiment = sentiment_obj.get('sentiment', 'neutral')
+    confidence = sentiment_obj.get('confidence', 50)
+    
+    # Convert sentiment direction to score
+    if sentiment == 'positive':
+        overall_score = confidence / 100.0
+    elif sentiment == 'negative':
+        overall_score = -confidence / 100.0
+    else:  # neutral
+        overall_score = 0.0
+    
     # Build new format
     new_pred = {
         "timestamp": old_pred.get('timestamp'),
         "recommendation": recommendation_obj.get('action', 'HOLD').upper(),
         "confidence_level": convert_confidence_to_level(recommendation_obj.get('confidence', 50)),
         "sentiment_analysis": {
-            "sentiment": sentiment_obj.get('sentiment', 'neutral'),
-            "confidence": sentiment_obj.get('confidence', 50),
+            "sentiment": sentiment,
+            "confidence": confidence,
             "key_points": sentiment_obj.get('key_points', []),
-            "overall_score": sentiment_obj.get('confidence', 50) / 100.0
+            "overall_score": overall_score
         },
         "position_sizing": {
             "recommended_size": position_sizing.get('percentage_of_portfolio', 0)
