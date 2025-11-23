@@ -887,7 +887,7 @@ class BitcoinTradingBot:
         # Prepare results in evaluation framework format
         evaluation_format = {
             "timestamp": datetime.now().isoformat(),
-            "recommendation": recommendation.action.upper(),
+            "recommendation": recommendation.action.upper(),  # Ensure uppercase for evaluation framework
             "confidence_level": recommendation.confidence,
             "sentiment_analysis": {
                 "sentiment": sentiment.sentiment,
