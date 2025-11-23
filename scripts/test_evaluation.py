@@ -54,7 +54,7 @@ def check_results_directory():
     print_status(f"Results directory exists: {results_dir}", 'success')
     
     # Count JSON files
-    json_files = list(results_dir.glob('*.json'))
+    json_files = list(results_dir.glob('evaluation_format_*.json'))
     
     if not json_files:
         print_status("No prediction files found", 'warning')
