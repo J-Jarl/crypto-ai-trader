@@ -153,7 +153,7 @@ class TradingEvaluator:
         """
         # Extract prediction data
         timestamp_str = prediction.get('timestamp', '')
-        recommendation = prediction.get('recommendation', '')
+        recommendation = prediction.get('recommendation', {}).get('action', '').upper()
         confidence = prediction.get('confidence_level', 'UNKNOWN')
         sentiment = prediction.get('sentiment_analysis', {})
         
@@ -181,15 +181,15 @@ class TradingEvaluator:
         # Evaluate sentiment accuracy
         sentiment_score = sentiment.get('overall_score', 0)
         sentiment_matches_price = self._evaluate_sentiment(sentiment_score, percent_change)
-        
+
         # Calculate would-be profit/loss
-        position_size = prediction.get('position_sizing', {}).get('recommended_size', 0)
+        position_size = prediction.get('position_sizing', {}).get('btc_amount', 0)
         pnl = self._calculate_pnl(
             recommendation,
             start_price,
             end_price,
             position_size,
-            prediction.get('risk_management', {})
+            prediction.get('position_sizing', {})
         )
         
         # Compile evaluation results
