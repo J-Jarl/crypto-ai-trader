@@ -37,3 +37,4 @@ scripts/test_cases.json
 .aider.msg.md
 .aider.tags.cache.v4/
 .aider*
+automation.log
