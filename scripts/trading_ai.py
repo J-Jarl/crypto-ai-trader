@@ -55,8 +55,11 @@ class MarketData:
     fear_greed_index: Optional[int]  # 0-100
     fear_greed_classification: Optional[str]
     rsi_14: Optional[float]  # 0-100
+    sma_5: Optional[float]
+    sma_10: Optional[float]
     sma_20: Optional[float]
     sma_50: Optional[float]
+    ema_9: Optional[float]
     price_vs_sma20: Optional[str]  # "above" or "below"
     price_vs_sma50: Optional[str]  # "above" or "below"
     # Diagnostic info
@@ -221,6 +224,22 @@ class MarketDataFetcher:
             return None
         return round(sum(prices[-period:]) / period, 2)
 
+    def calculate_ema(self, prices: List[float], period: int) -> Optional[float]:
+        """Calculate Exponential Moving Average"""
+        if len(prices) < period:
+            return None
+
+        # Start with SMA for the first value
+        sma = sum(prices[:period]) / period
+        ema = sma
+
+        # Calculate EMA for remaining prices
+        multiplier = 2 / (period + 1)
+        for price in prices[period:]:
+            ema = (price - ema) * multiplier + ema
+
+        return round(ema, 2)
+
     def fetch_market_data(self) -> MarketData:
         """Fetch comprehensive market data including technical indicators"""
         exchange_error = None
@@ -238,7 +257,14 @@ class MarketDataFetcher:
                 ticker = self.exchange.fetch_ticker('BTC/USDT')
 
             current_price = ticker.get('last', 0) or ticker.get('close', 0)
-            volume_24h = ticker.get('quoteVolume', 0) or ticker.get('baseVolume', 0) or 0
+
+            # Get 24-hour volume by summing hourly candles
+            try:
+                ohlcv_1h = self.exchange.fetch_ohlcv('BTC/USD', '1h', limit=24)
+                volume_24h = sum(candle[5] for candle in ohlcv_1h) if ohlcv_1h else 0
+            except Exception as e:
+                volume_24h = 0
+
             price_change_24h = ticker.get('change', 0) or 0
             price_change_percentage_24h = ticker.get('percentage', 0) or 0
 
@@ -246,8 +272,11 @@ class MarketDataFetcher:
             ohlcv = self.get_btc_ohlcv(timeframe='1d', limit=100)
 
             rsi_14 = None
+            sma_5 = None
+            sma_10 = None
             sma_20 = None
             sma_50 = None
+            ema_9 = None
             price_vs_sma20 = None
             price_vs_sma50 = None
 
@@ -257,9 +286,14 @@ class MarketDataFetcher:
                 # Calculate RSI
                 rsi_14 = self.calculate_rsi(closing_prices, period=14)
 
-                # Calculate SMAs
+                # Calculate SMAs (short-term and long-term)
+                sma_5 = self.calculate_sma(closing_prices, period=5)
+                sma_10 = self.calculate_sma(closing_prices, period=10)
                 sma_20 = self.calculate_sma(closing_prices, period=20)
                 sma_50 = self.calculate_sma(closing_prices, period=50)
+
+                # Calculate EMA
+                ema_9 = self.calculate_ema(closing_prices, period=9)
 
                 # Determine price position relative to SMAs
                 if sma_20:
@@ -279,8 +313,11 @@ class MarketDataFetcher:
                 fear_greed_index=fear_greed_value,
                 fear_greed_classification=fear_greed_class,
                 rsi_14=rsi_14,
+                sma_5=sma_5,
+                sma_10=sma_10,
                 sma_20=sma_20,
                 sma_50=sma_50,
+                ema_9=ema_9,
                 price_vs_sma20=price_vs_sma20,
                 price_vs_sma50=price_vs_sma50,
                 exchange_available=True,
@@ -317,8 +354,11 @@ class MarketDataFetcher:
             fear_greed_index=fear_greed_value,
             fear_greed_classification=fear_greed_class,
             rsi_14=None,
+            sma_5=None,
+            sma_10=None,
             sma_20=None,
             sma_50=None,
+            ema_9=None,
             price_vs_sma20=None,
             price_vs_sma50=None,
             exchange_available=False,
@@ -526,12 +566,22 @@ class BitcoinSentimentAnalyzer:
 Current Market Data:
 - Price: ${market_data.current_price:,.2f}
 - 24h Change: {market_data.price_change_percentage_24h:+.2f}%
-- 24h Volume: ${market_data.volume_24h:,.0f}
+- 24h Volume: {market_data.volume_24h:,.0f} BTC
 """
             if market_data.fear_greed_index:
                 market_context += f"- Fear & Greed Index: {market_data.fear_greed_index} ({market_data.fear_greed_classification})\n"
             if market_data.rsi_14:
                 market_context += f"- RSI(14): {market_data.rsi_14}\n"
+
+            # Short-term moving averages
+            if market_data.sma_5:
+                market_context += f"- SMA(5): ${market_data.sma_5:,.2f}\n"
+            if market_data.sma_10:
+                market_context += f"- SMA(10): ${market_data.sma_10:,.2f}\n"
+            if market_data.ema_9:
+                market_context += f"- EMA(9): ${market_data.ema_9:,.2f}\n"
+
+            # Medium/Long-term moving averages
             if market_data.sma_20:
                 market_context += f"- SMA(20): ${market_data.sma_20:,.2f} (Price is {market_data.price_vs_sma20})\n"
             if market_data.sma_50:
@@ -650,6 +700,21 @@ Use technical indicators (RSI, moving averages) and market sentiment (Fear & Gre
             market_context = f"\nTechnical Indicators:\n"
             if market_data.rsi_14:
                 market_context += f"- RSI(14): {market_data.rsi_14} (>70 overbought, <30 oversold)\n"
+
+            # Short-term moving averages for 4-hour signals
+            if market_data.sma_5:
+                market_context += f"- SMA(5): ${market_data.sma_5:,.2f}\n"
+            if market_data.sma_10:
+                market_context += f"- SMA(10): ${market_data.sma_10:,.2f}\n"
+            if market_data.ema_9:
+                market_context += f"- EMA(9): ${market_data.ema_9:,.2f}\n"
+
+            # Medium/Long-term moving averages
+            if market_data.sma_20:
+                market_context += f"- SMA(20): ${market_data.sma_20:,.2f}\n"
+            if market_data.sma_50:
+                market_context += f"- SMA(50): ${market_data.sma_50:,.2f}\n"
+
             if market_data.price_vs_sma20:
                 market_context += f"- Price vs SMA(20): {market_data.price_vs_sma20}\n"
             if market_data.price_vs_sma50:
@@ -844,6 +909,15 @@ class BitcoinTradingBot:
             print(f"Fear & Greed Index: {market_data.fear_greed_index} ({market_data.fear_greed_classification})")
         if market_data.rsi_14:
             print(f"RSI(14): {market_data.rsi_14}")
+        if market_data.sma_5 or market_data.sma_10 or market_data.ema_9:
+            indicators = []
+            if market_data.sma_5:
+                indicators.append(f"SMA(5): ${market_data.sma_5:,.2f}")
+            if market_data.sma_10:
+                indicators.append(f"SMA(10): ${market_data.sma_10:,.2f}")
+            if market_data.ema_9:
+                indicators.append(f"EMA(9): ${market_data.ema_9:,.2f}")
+            print(f"Short-term MAs: {', '.join(indicators)}")
         print()
 
         # Fetch news articles
@@ -936,6 +1010,9 @@ class BitcoinTradingBot:
                 "fear_greed_index": market_data.fear_greed_index,
                 "fear_greed_classification": market_data.fear_greed_classification,
                 "rsi_14": market_data.rsi_14,
+                "sma_5": market_data.sma_5,
+                "sma_10": market_data.sma_10,
+                "ema_9": market_data.ema_9,
                 "sma_20": market_data.sma_20,
                 "sma_50": market_data.sma_50,
                 "price_vs_sma20": market_data.price_vs_sma20,
@@ -1002,7 +1079,7 @@ class BitcoinTradingBot:
                     if mkt['price_change_24h'] != 0:
                         print(f"24h Change: {mkt['price_change_24h']:+.2f}%")
                     if mkt['volume_24h'] > 0:
-                        print(f"24h Volume: ${mkt['volume_24h']:,.0f}")
+                        print(f"24h Volume: {mkt['volume_24h']:,.0f} BTC")
 
                 if mkt.get('fear_greed_index'):
                     print(f"Fear & Greed Index: {mkt['fear_greed_index']} - {mkt['fear_greed_classification']}")
@@ -1011,6 +1088,15 @@ class BitcoinTradingBot:
                     rsi_signal = "Overbought" if mkt['rsi_14'] > 70 else ("Oversold" if mkt['rsi_14'] < 30 else "Neutral")
                     print(f"RSI(14): {mkt['rsi_14']} ({rsi_signal})")
 
+                # Short-term moving averages
+                if mkt.get('sma_5'):
+                    print(f"SMA(5): ${mkt['sma_5']:,.2f}")
+                if mkt.get('sma_10'):
+                    print(f"SMA(10): ${mkt['sma_10']:,.2f}")
+                if mkt.get('ema_9'):
+                    print(f"EMA(9): ${mkt['ema_9']:,.2f}")
+
+                # Medium/Long-term moving averages
                 if mkt.get('sma_20'):
                     print(f"SMA(20): ${mkt['sma_20']:,.2f} (Price is {mkt['price_vs_sma20']})")
 
