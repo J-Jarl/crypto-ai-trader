@@ -140,13 +140,13 @@ class TradingEvaluator:
 
         return results
 
-    def evaluate_prediction(self, prediction: Dict, hours_forward: int = 24) -> Dict:
+    def evaluate_prediction(self, prediction: Dict, hours_forward: int = 12) -> Dict:
         """
         Evaluate a single prediction against actual outcomes
 
         Args:
             prediction: The AI's trading recommendation
-            hours_forward: Hours to look forward for outcome (default 24)
+            hours_forward: Hours to look forward for outcome (default 12)
 
         Returns:
             Evaluation results dictionary
@@ -300,13 +300,13 @@ class TradingEvaluator:
         
         return round(pnl, 2)
     
-    def evaluate_all_predictions(self, hours_forward: int = 24,
+    def evaluate_all_predictions(self, hours_forward: int = 12,
                                  limit: int = None) -> List[Dict]:
         """
         Evaluate all predictions in the results directory
 
         Args:
-            hours_forward: Hours to look forward for outcomes
+            hours_forward: Hours to look forward for outcomes (default 12)
             limit: Maximum number of predictions to evaluate (None = all)
 
         Returns:
@@ -822,7 +822,7 @@ def main():
 
     print("Starting evaluation process...")
     print(f"Results directory: {evaluator.results_dir}")
-    print(f"Mode: {'Multi-timeframe (4h, 12h, 24h)' if multi_timeframe else 'Single timeframe (24h)'}")
+    print(f"Mode: {'Multi-timeframe (4h, 12h, 24h)' if multi_timeframe else 'Single timeframe (12h)'}")
     print()
 
     if multi_timeframe:
@@ -867,14 +867,14 @@ def main():
         print()
 
     else:
-        # Standard 24-hour evaluation
-        evaluations = evaluator.evaluate_all_predictions(hours_forward=24, limit=10)
+        # Standard 12-hour evaluation
+        evaluations = evaluator.evaluate_all_predictions(limit=10)
 
         if not evaluations:
             print("❌ No predictions could be evaluated.")
             print("   This could be because:")
             print("   - No prediction files exist")
-            print("   - Predictions are too recent (need 24h of price history)")
+            print("   - Predictions are too recent (need 12h of price history)")
             print("   - Exchange API is unavailable")
             return
 
