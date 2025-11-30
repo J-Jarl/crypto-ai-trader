@@ -97,14 +97,57 @@ class TradingEvaluator:
         
         return None, None, None
     
+    def evaluate_multiple_timeframes(self, prediction: Dict) -> Dict:
+        """
+        Evaluate a single prediction at multiple timeframes (4h, 12h, 24h)
+
+        Args:
+            prediction: The AI's trading recommendation
+
+        Returns:
+            Dictionary with evaluation results for each timeframe
+        """
+        timeframes = [4, 12, 24]
+        results = {}
+
+        # Parse prediction timestamp
+        timestamp_str = prediction.get('timestamp', '')
+        try:
+            pred_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        except:
+            print(f"Invalid timestamp format: {timestamp_str}")
+            return None
+
+        # Check how much time has passed since prediction
+        time_since_prediction = datetime.now(pred_time.tzinfo) - pred_time
+        hours_elapsed = time_since_prediction.total_seconds() / 3600
+
+        # Evaluate each timeframe if enough time has passed
+        for hours in timeframes:
+            if hours_elapsed >= hours:
+                # Sufficient time has passed for this evaluation
+                evaluation = self.evaluate_prediction(prediction, hours_forward=hours)
+                if evaluation:
+                    results[f'{hours}h'] = evaluation
+            else:
+                # Not enough time has passed yet
+                results[f'{hours}h'] = {
+                    'status': 'pending',
+                    'message': f'Need {hours - hours_elapsed:.1f} more hours',
+                    'hours_needed': hours,
+                    'hours_elapsed': round(hours_elapsed, 1)
+                }
+
+        return results
+
     def evaluate_prediction(self, prediction: Dict, hours_forward: int = 24) -> Dict:
         """
         Evaluate a single prediction against actual outcomes
-        
+
         Args:
             prediction: The AI's trading recommendation
             hours_forward: Hours to look forward for outcome (default 24)
-            
+
         Returns:
             Evaluation results dictionary
         """
@@ -257,54 +300,119 @@ class TradingEvaluator:
         
         return round(pnl, 2)
     
-    def evaluate_all_predictions(self, hours_forward: int = 24, 
+    def evaluate_all_predictions(self, hours_forward: int = 24,
                                  limit: int = None) -> List[Dict]:
         """
         Evaluate all predictions in the results directory
-        
+
         Args:
             hours_forward: Hours to look forward for outcomes
             limit: Maximum number of predictions to evaluate (None = all)
-            
+
         Returns:
             List of evaluation results
         """
-        # Get all JSON files in results directory
-        json_files = sorted(self.results_dir.glob('*.json'), reverse=True)
-        
+        # Get all prediction JSON files (exclude evaluation reports)
+        all_files = sorted(self.results_dir.glob('*.json'), reverse=True)
+        json_files = [f for f in all_files if not f.name.startswith('evaluation_')]
+
         if limit:
             json_files = json_files[:limit]
-        
+
         print(f"\n{'='*60}")
         print(f"EVALUATING {len(json_files)} PREDICTIONS")
         print(f"{'='*60}\n")
-        
+
         evaluations = []
-        
+
         for i, filepath in enumerate(json_files, 1):
             print(f"[{i}/{len(json_files)}] Evaluating: {filepath.name}")
-            
+
             prediction = self.load_prediction(filepath)
             if not prediction:
                 continue
-            
+
             evaluation = self.evaluate_prediction(prediction, hours_forward)
             if evaluation:
                 evaluations.append(evaluation)
                 self._print_evaluation_summary(evaluation)
-        
+
         return evaluations
+
+    def evaluate_all_predictions_multi_timeframe(self, limit: int = None) -> Dict:
+        """
+        Evaluate all predictions at multiple timeframes (4h, 12h, 24h)
+
+        Args:
+            limit: Maximum number of predictions to evaluate (None = all)
+
+        Returns:
+            Dictionary with timeframe-separated evaluation results
+        """
+        # Get all prediction JSON files (exclude evaluation reports)
+        all_files = sorted(self.results_dir.glob('*.json'), reverse=True)
+        json_files = [f for f in all_files if not f.name.startswith('evaluation_')]
+
+        if limit:
+            json_files = json_files[:limit]
+
+        print(f"\n{'='*60}")
+        print(f"MULTI-TIMEFRAME EVALUATION: {len(json_files)} PREDICTIONS")
+        print(f"Timeframes: 4h, 12h, 24h")
+        print(f"{'='*60}\n")
+
+        # Store results by timeframe
+        timeframe_results = {
+            '4h': [],
+            '12h': [],
+            '24h': []
+        }
+
+        for i, filepath in enumerate(json_files, 1):
+            print(f"[{i}/{len(json_files)}] Evaluating: {filepath.name}")
+
+            prediction = self.load_prediction(filepath)
+            if not prediction:
+                continue
+
+            # Evaluate at all timeframes
+            multi_eval = self.evaluate_multiple_timeframes(prediction)
+            if not multi_eval:
+                continue
+
+            # Distribute results to appropriate timeframe lists
+            for timeframe in ['4h', '12h', '24h']:
+                tf_eval = multi_eval.get(timeframe)
+                if tf_eval and tf_eval.get('status') != 'pending':
+                    timeframe_results[timeframe].append(tf_eval)
+
+            # Print summary for completed evaluations
+            self._print_multi_timeframe_summary(multi_eval)
+
+        return timeframe_results
     
     def _print_evaluation_summary(self, evaluation: Dict):
         """Print a brief summary of single evaluation"""
         correct_icon = "✓" if evaluation['prediction_correct'] else "✗"
         sentiment_icon = "✓" if evaluation['sentiment_accurate'] else "✗"
-        
+
         print(f"  Recommendation: {evaluation['recommendation']}")
         print(f"  Price Change: {evaluation['percent_change']:+.2f}%")
         print(f"  Prediction Correct: {correct_icon}")
         print(f"  Sentiment Accurate: {sentiment_icon}")
         print(f"  Hypothetical PnL: ${evaluation['hypothetical_pnl']:+,.2f}")
+        print()
+
+    def _print_multi_timeframe_summary(self, multi_eval: Dict):
+        """Print summary for multi-timeframe evaluation"""
+        print(f"  Timeframe Results:")
+        for timeframe in ['4h', '12h', '24h']:
+            tf_result = multi_eval.get(timeframe, {})
+            if tf_result.get('status') == 'pending':
+                print(f"    {timeframe}: ⏳ {tf_result['message']}")
+            elif 'prediction_correct' in tf_result:
+                correct_icon = "✓" if tf_result['prediction_correct'] else "✗"
+                print(f"    {timeframe}: {correct_icon} {tf_result['percent_change']:+.2f}% | PnL: ${tf_result['hypothetical_pnl']:+,.2f}")
         print()
     
     def generate_performance_report(self, evaluations: List[Dict]) -> Dict:
@@ -396,6 +504,98 @@ class TradingEvaluator:
         
         return report
     
+    def generate_multi_timeframe_report(self, timeframe_results: Dict) -> Dict:
+        """
+        Generate performance report comparing different timeframes
+
+        Args:
+            timeframe_results: Dictionary with results by timeframe (4h, 12h, 24h)
+
+        Returns:
+            Multi-timeframe comparison report
+        """
+        report = {
+            'timeframe_comparison': {},
+            'best_timeframe': None,
+            'summary': {}
+        }
+
+        # Generate stats for each timeframe
+        for timeframe in ['4h', '12h', '24h']:
+            evaluations = timeframe_results.get(timeframe, [])
+
+            if not evaluations:
+                report['timeframe_comparison'][timeframe] = {
+                    'status': 'no_data',
+                    'message': 'Insufficient data for this timeframe'
+                }
+                continue
+
+            # Calculate metrics for this timeframe
+            total = len(evaluations)
+            correct = sum(1 for e in evaluations if e['prediction_correct'])
+            accuracy = (correct / total) * 100 if total > 0 else 0
+
+            total_pnl = sum(e['hypothetical_pnl'] for e in evaluations)
+            winning = [e for e in evaluations if e['hypothetical_pnl'] > 0]
+            win_rate = (len(winning) / total) * 100 if total > 0 else 0
+
+            avg_pnl = total_pnl / total if total > 0 else 0
+            avg_win = sum(e['hypothetical_pnl'] for e in winning) / len(winning) if winning else 0
+
+            report['timeframe_comparison'][timeframe] = {
+                'total_predictions': total,
+                'accuracy': round(accuracy, 2),
+                'correct_predictions': correct,
+                'win_rate': round(win_rate, 2),
+                'total_pnl': round(total_pnl, 2),
+                'average_pnl': round(avg_pnl, 2),
+                'average_win': round(avg_win, 2),
+                'winning_trades': len(winning)
+            }
+
+        # Determine best timeframe
+        best_tf = None
+        best_accuracy = 0
+        for tf, stats in report['timeframe_comparison'].items():
+            if stats.get('status') != 'no_data' and stats['accuracy'] > best_accuracy:
+                best_accuracy = stats['accuracy']
+                best_tf = tf
+
+        report['best_timeframe'] = {
+            'timeframe': best_tf,
+            'accuracy': best_accuracy,
+            'reason': 'Highest prediction accuracy'
+        }
+
+        # Summary statistics
+        report['summary'] = {
+            'timeframes_evaluated': [tf for tf in ['4h', '12h', '24h']
+                                    if timeframe_results.get(tf)],
+            'recommendation': self._get_timeframe_recommendation(report['timeframe_comparison'])
+        }
+
+        return report
+
+    def _get_timeframe_recommendation(self, comparison: Dict) -> str:
+        """Generate recommendation based on timeframe performance"""
+        timeframes_with_data = [(tf, stats) for tf, stats in comparison.items()
+                               if stats.get('status') != 'no_data']
+
+        if not timeframes_with_data:
+            return "Insufficient data to make recommendations"
+
+        # Find best by accuracy
+        best_acc = max(timeframes_with_data, key=lambda x: x[1]['accuracy'])
+
+        # Find best by win rate
+        best_wr = max(timeframes_with_data, key=lambda x: x[1]['win_rate'])
+
+        if best_acc[0] == best_wr[0]:
+            return f"Focus on {best_acc[0]} timeframe - best accuracy ({best_acc[1]['accuracy']:.1f}%) and win rate ({best_acc[1]['win_rate']:.1f}%)"
+        else:
+            return f"Mixed results: {best_acc[0]} has best accuracy ({best_acc[1]['accuracy']:.1f}%), {best_wr[0]} has best win rate ({best_wr[1]['win_rate']:.1f}%)"
+
     def _calc_accuracy(self, evaluations: List[Dict]) -> float:
         """Calculate accuracy percentage for subset of evaluations"""
         if not evaluations:
@@ -541,47 +741,152 @@ class TradingEvaluator:
         
         print(f"{'='*60}\n")
 
+    def print_multi_timeframe_report(self, report: Dict):
+        """Print formatted multi-timeframe comparison report"""
+        print(f"\n{'='*60}")
+        print(f"MULTI-TIMEFRAME PERFORMANCE COMPARISON")
+        print(f"{'='*60}\n")
+
+        comparison = report['timeframe_comparison']
+
+        print(f"⏱️  TIMEFRAME ANALYSIS (4h vs 12h vs 24h)\n")
+
+        # Print table header
+        print(f"{'Metric':<25} {'4h':>12} {'12h':>12} {'24h':>12}")
+        print(f"{'-'*60}")
+
+        # Prepare data for each metric
+        metrics = {
+            'Total Predictions': 'total_predictions',
+            'Accuracy (%)': 'accuracy',
+            'Win Rate (%)': 'win_rate',
+            'Total PnL ($)': 'total_pnl',
+            'Average PnL ($)': 'average_pnl',
+            'Average Win ($)': 'average_win'
+        }
+
+        for metric_name, metric_key in metrics.items():
+            values = []
+            for tf in ['4h', '12h', '24h']:
+                tf_data = comparison.get(tf, {})
+                if tf_data.get('status') == 'no_data':
+                    values.append('N/A')
+                else:
+                    val = tf_data.get(metric_key, 0)
+                    if metric_key in ['total_pnl', 'average_pnl', 'average_win']:
+                        values.append(f"${val:+,.2f}")
+                    elif metric_key == 'total_predictions':
+                        values.append(str(val))
+                    else:
+                        values.append(f"{val:.1f}%")
+
+            print(f"{metric_name:<25} {values[0]:>12} {values[1]:>12} {values[2]:>12}")
+
+        print()
+
+        # Best timeframe
+        if report['best_timeframe']['timeframe']:
+            print(f"🏆 BEST TIMEFRAME")
+            print(f"   Winner: {report['best_timeframe']['timeframe']}")
+            print(f"   Accuracy: {report['best_timeframe']['accuracy']:.1f}%")
+            print(f"   Reason: {report['best_timeframe']['reason']}")
+            print()
+
+        # Recommendation
+        print(f"💡 RECOMMENDATION")
+        print(f"   {report['summary']['recommendation']}")
+        print()
+
+        print(f"{'='*60}\n")
+
 
 def main():
     """Main execution function"""
+    import sys
+
     print("\n" + "="*60)
     print("BITCOIN TRADING AI - EVALUATION FRAMEWORK")
     print("="*60 + "\n")
-    
+
     # Initialize evaluator
     evaluator = TradingEvaluator()
-    
+
     # Check if results directory exists
     if not evaluator.results_dir.exists():
         print(f"❌ Results directory not found: {evaluator.results_dir}")
         print("   Please ensure trading_ai.py has generated some predictions first.")
         return
-    
-    # Run evaluation
+
+    # Check for multi-timeframe mode
+    multi_timeframe = '--multi-timeframe' in sys.argv or '-m' in sys.argv
+
     print("Starting evaluation process...")
     print(f"Results directory: {evaluator.results_dir}")
+    print(f"Mode: {'Multi-timeframe (4h, 12h, 24h)' if multi_timeframe else 'Single timeframe (24h)'}")
     print()
-    
-    # Evaluate all predictions (24-hour forward looking window)
-    evaluations = evaluator.evaluate_all_predictions(hours_forward=24, limit=10)
-    
-    if not evaluations:
-        print("❌ No predictions could be evaluated.")
-        print("   This could be because:")
-        print("   - No prediction files exist")
-        print("   - Predictions are too recent (need 24h of price history)")
-        print("   - Exchange API is unavailable")
-        return
-    
-    # Generate performance report
-    report = evaluator.generate_performance_report(evaluations)
-    
-    # Display report
-    evaluator.print_performance_report(report)
-    
-    # Save results
-    evaluator.save_evaluation_results(evaluations, report)
-    
+
+    if multi_timeframe:
+        # Multi-timeframe evaluation
+        timeframe_results = evaluator.evaluate_all_predictions_multi_timeframe(limit=10)
+
+        # Check if we got any results
+        has_data = any(len(results) > 0 for results in timeframe_results.values())
+
+        if not has_data:
+            print("❌ No predictions could be evaluated for any timeframe.")
+            print("   This could be because:")
+            print("   - No prediction files exist")
+            print("   - Predictions are too recent (need at least 4h of price history)")
+            print("   - Exchange API is unavailable")
+            return
+
+        # Generate and display multi-timeframe report
+        multi_report = evaluator.generate_multi_timeframe_report(timeframe_results)
+        evaluator.print_multi_timeframe_report(multi_report)
+
+        # Save results
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"evaluation_multi_timeframe_{timestamp}.json"
+        output_path = evaluator.results_dir / filename
+
+        output_data = {
+            'generated_at': datetime.now().isoformat(),
+            'mode': 'multi_timeframe',
+            'timeframe_report': multi_report,
+            'timeframe_results': {tf: results for tf, results in timeframe_results.items()}
+        }
+
+        with open(output_path, 'w') as f:
+            import json
+            json.dump(output_data, f, indent=2)
+
+        print(f"\n{'='*60}")
+        print(f"MULTI-TIMEFRAME RESULTS SAVED")
+        print(f"{'='*60}")
+        print(f"Location: {output_path}")
+        print()
+
+    else:
+        # Standard 24-hour evaluation
+        evaluations = evaluator.evaluate_all_predictions(hours_forward=24, limit=10)
+
+        if not evaluations:
+            print("❌ No predictions could be evaluated.")
+            print("   This could be because:")
+            print("   - No prediction files exist")
+            print("   - Predictions are too recent (need 24h of price history)")
+            print("   - Exchange API is unavailable")
+            return
+
+        # Generate performance report
+        report = evaluator.generate_performance_report(evaluations)
+
+        # Display report
+        evaluator.print_performance_report(report)
+
+        # Save results
+        evaluator.save_evaluation_results(evaluations, report)
+
     print("✅ Evaluation complete!")
     print()
 
