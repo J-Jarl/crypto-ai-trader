@@ -62,6 +62,17 @@ class MarketData:
     ema_9: Optional[float]
     price_vs_sma20: Optional[str]  # "above" or "below"
     price_vs_sma50: Optional[str]  # "above" or "below"
+    # Liquidity zone analysis
+    nearest_support: Optional[float] = None
+    nearest_resistance: Optional[float] = None
+    distance_to_support_pct: Optional[float] = None
+    distance_to_resistance_pct: Optional[float] = None
+    volume_ratio: Optional[float] = None
+    volume_spike: bool = False
+    potential_liquidity_zone: bool = False
+    # Wyckoff pattern detection
+    wyckoff_pattern: Optional[str] = None
+    wyckoff_details: Optional[Dict] = None
     # Diagnostic info
     exchange_available: bool = False
     exchange_name: str = "None"
@@ -240,6 +251,477 @@ class MarketDataFetcher:
 
         return round(ema, 2)
 
+    def calculate_atr(self, ohlcv_data: List[List], period: int = 14) -> Optional[float]:
+        """
+        Calculate Average True Range (ATR) for volatility measurement.
+
+        Args:
+            ohlcv_data: OHLCV candle data [timestamp, open, high, low, close, volume]
+            period: ATR period (default 14)
+
+        Returns:
+            ATR value or None if insufficient data
+        """
+        if not ohlcv_data or len(ohlcv_data) < period + 1:
+            return None
+
+        true_ranges = []
+
+        for i in range(1, len(ohlcv_data)):
+            high = ohlcv_data[i][2]
+            low = ohlcv_data[i][3]
+            prev_close = ohlcv_data[i-1][4]
+
+            # True Range is the greatest of:
+            # 1. Current High - Current Low
+            # 2. abs(Current High - Previous Close)
+            # 3. abs(Current Low - Previous Close)
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close)
+            )
+            true_ranges.append(tr)
+
+        if len(true_ranges) < period:
+            return None
+
+        # Calculate ATR as simple moving average of True Ranges
+        atr = sum(true_ranges[-period:]) / period
+        return round(atr, 2)
+
+    def calculate_hybrid_stop_loss(
+        self,
+        ohlcv_data: List[List],
+        entry_price: float,
+        target_price: Optional[float],
+        action: str,  # "buy" or "sell"
+        portfolio_value: float
+    ) -> Dict:
+        """
+        Calculate hybrid stop-loss with ATR, R/R validation, and leverage optimization.
+
+        Args:
+            ohlcv_data: OHLCV candle data
+            entry_price: Entry price for the trade
+            target_price: Take profit target (optional)
+            action: Trade direction ("buy" or "sell")
+            portfolio_value: Total portfolio value in USD
+
+        Returns:
+            Dictionary with comprehensive stop-loss and leverage analysis
+        """
+        # Calculate ATR
+        atr = self.calculate_atr(ohlcv_data, period=14)
+
+        if not atr or not entry_price or entry_price <= 0:
+            return {
+                "atr_value": None,
+                "atr_stop_loss": None,
+                "risk_reward_ratio": None,
+                "meets_rr_minimum": False,
+                "recommended_leverage": 1,
+                "leverage_analysis": {},
+                "max_safe_position_pct": 5.0,
+                "stop_type": "ATR-based hybrid",
+                "error": "Insufficient data or invalid entry price"
+            }
+
+        # Calculate ATR-based stop loss (2.5x ATR from entry)
+        if action.lower() == "buy":
+            atr_stop_loss = entry_price - (2.5 * atr)
+        else:  # sell
+            atr_stop_loss = entry_price + (2.5 * atr)
+
+        # Calculate risk/reward ratio
+        risk_reward_ratio = None
+        meets_rr_minimum = False
+
+        if target_price and target_price > 0:
+            if action.lower() == "buy":
+                potential_profit = target_price - entry_price
+                potential_loss = entry_price - atr_stop_loss
+            else:  # sell
+                potential_profit = entry_price - target_price
+                potential_loss = atr_stop_loss - entry_price
+
+            if potential_loss > 0:
+                risk_reward_ratio = round(potential_profit / potential_loss, 2)
+                meets_rr_minimum = risk_reward_ratio >= 2.0
+
+        # Leverage optimization analysis
+        leverage_levels = [1, 2, 3, 5, 10]
+        leverage_analysis = {}
+        recommended_leverage = 1
+        max_safe_position_pct = 5.0
+
+        for leverage in leverage_levels:
+            analysis = self._analyze_leverage_level(
+                leverage=leverage,
+                entry_price=entry_price,
+                atr_stop_loss=atr_stop_loss,
+                atr=atr,
+                action=action,
+                portfolio_value=portfolio_value
+            )
+            leverage_analysis[f"{leverage}x"] = analysis
+
+            # Update recommended leverage if this level is safe
+            if analysis["safe"] and leverage > recommended_leverage:
+                recommended_leverage = leverage
+                max_safe_position_pct = analysis["max_position"]
+
+        return {
+            "atr_value": round(atr, 2),
+            "atr_stop_loss": round(atr_stop_loss, 2),
+            "risk_reward_ratio": risk_reward_ratio,
+            "meets_rr_minimum": meets_rr_minimum,
+            "recommended_leverage": recommended_leverage,
+            "leverage_analysis": leverage_analysis,
+            "max_safe_position_pct": round(max_safe_position_pct, 2),
+            "stop_type": "ATR-based hybrid"
+        }
+
+    def _analyze_leverage_level(
+        self,
+        leverage: int,
+        entry_price: float,
+        atr_stop_loss: float,
+        atr: float,
+        action: str,
+        portfolio_value: float
+    ) -> Dict:
+        """
+        Analyze a specific leverage level for safety and position sizing.
+
+        Returns:
+            Dict with liquidation price, safety status, and max position size
+        """
+        # Calculate liquidation price
+        # For long: liq_price = entry * (1 - 1/leverage * 0.9)  # 90% to account for fees
+        # For short: liq_price = entry * (1 + 1/leverage * 0.9)
+
+        if leverage == 1:
+            # No leverage, no liquidation
+            liq_price = None
+            safe = True
+            max_position = 5.0  # 5% of portfolio
+        else:
+            if action.lower() == "buy":
+                # Long position - liquidation below entry
+                liq_price = round(entry_price * (1 - (1 / leverage) * 0.9), 2)
+
+                # Check if liquidation is beyond stop + 1.5 ATR buffer
+                required_liq_price = atr_stop_loss - (1.5 * atr)
+                buffer_pct = ((atr_stop_loss - liq_price) / atr_stop_loss) * 100 if atr_stop_loss > 0 else 0
+
+            else:  # sell/short
+                # Short position - liquidation above entry
+                liq_price = round(entry_price * (1 + (1 / leverage) * 0.9), 2)
+
+                # Check if liquidation is beyond stop + 1.5 ATR buffer
+                required_liq_price = atr_stop_loss + (1.5 * atr)
+                buffer_pct = ((liq_price - atr_stop_loss) / atr_stop_loss) * 100 if atr_stop_loss > 0 else 0
+
+            # Safety criteria:
+            # 1. Liquidation must be beyond stop + 1.5 ATR
+            # 2. Buffer must be >= 20% beyond stop loss
+            if action.lower() == "buy":
+                safe = (liq_price <= required_liq_price) and (buffer_pct >= 20)
+            else:
+                safe = (liq_price >= required_liq_price) and (buffer_pct >= 20)
+
+            # Calculate max position size based on leverage and safety
+            # Higher leverage = smaller position to maintain safety
+            base_position = 5.0  # 5% base
+            max_position = min(base_position, base_position / (leverage / 2))
+
+        return {
+            "liq_price": liq_price,
+            "safe": safe,
+            "max_position": round(max_position, 1)
+        }
+
+    def detect_wyckoff_patterns(self, ohlcv_data: List[List]) -> Dict:
+        """
+        Detect Wyckoff accumulation/distribution patterns and failed breakouts.
+
+        Args:
+            ohlcv_data: OHLCV candle data [timestamp, open, high, low, close, volume]
+
+        Returns:
+            Dictionary with pattern type and details
+        """
+        if not ohlcv_data or len(ohlcv_data) < 20:
+            return {"pattern": "none"}
+
+        # Extract highs, lows, closes, and volumes
+        highs = [candle[2] for candle in ohlcv_data]
+        lows = [candle[3] for candle in ohlcv_data]
+        closes = [candle[4] for candle in ohlcv_data]
+        volumes = [candle[5] for candle in ohlcv_data]
+
+        # Find all swing highs and lows with their indices and volumes
+        swing_highs = []
+        for i in range(2, len(highs) - 2):
+            if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
+                highs[i] > highs[i+1] and highs[i] > highs[i+2]):
+                swing_highs.append({"price": highs[i], "index": i, "volume": volumes[i]})
+
+        swing_lows = []
+        for i in range(2, len(lows) - 2):
+            if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and
+                lows[i] < lows[i+1] and lows[i] < lows[i+2]):
+                swing_lows.append({"price": lows[i], "index": i, "volume": volumes[i]})
+
+        # 1. Check for Distribution Pattern (multiple tests of resistance)
+        distribution = self._detect_distribution(swing_highs)
+        if distribution:
+            return distribution
+
+        # 2. Check for Accumulation Pattern (multiple tests of support)
+        accumulation = self._detect_accumulation(swing_lows)
+        if accumulation:
+            return accumulation
+
+        # 3. Check for Failed Breakouts (liquidity grabs)
+        failed_breakout = self._detect_failed_breakout(ohlcv_data, swing_highs, swing_lows)
+        if failed_breakout:
+            return failed_breakout
+
+        return {"pattern": "none"}
+
+    def _detect_distribution(self, swing_highs: List[Dict]) -> Optional[Dict]:
+        """Detect distribution pattern - multiple tests of same resistance level"""
+        if len(swing_highs) < 3:
+            return None
+
+        # Group swing highs by similar price levels (within 2% tolerance)
+        tolerance = 0.02
+        resistance_clusters = []
+
+        for swing in swing_highs:
+            price = swing["price"]
+            added_to_cluster = False
+
+            # Try to add to existing cluster
+            for cluster in resistance_clusters:
+                cluster_avg = sum(s["price"] for s in cluster) / len(cluster)
+                if abs(price - cluster_avg) / cluster_avg <= tolerance:
+                    cluster.append(swing)
+                    added_to_cluster = True
+                    break
+
+            # Create new cluster if not added
+            if not added_to_cluster:
+                resistance_clusters.append([swing])
+
+        # Find clusters with 3+ tests
+        for cluster in resistance_clusters:
+            if len(cluster) >= 3:
+                # Check if volumes are declining (distribution signature)
+                volumes = [s["volume"] for s in cluster]
+                volume_declining = all(volumes[i] > volumes[i+1] for i in range(len(volumes)-1))
+
+                resistance_level = sum(s["price"] for s in cluster) / len(cluster)
+                return {
+                    "pattern": "distribution",
+                    "resistance_level": round(resistance_level, 2),
+                    "test_count": len(cluster),
+                    "volume_declining": volume_declining
+                }
+
+        return None
+
+    def _detect_accumulation(self, swing_lows: List[Dict]) -> Optional[Dict]:
+        """Detect accumulation pattern - multiple tests of same support level"""
+        if len(swing_lows) < 3:
+            return None
+
+        # Group swing lows by similar price levels (within 2% tolerance)
+        tolerance = 0.02
+        support_clusters = []
+
+        for swing in swing_lows:
+            price = swing["price"]
+            added_to_cluster = False
+
+            # Try to add to existing cluster
+            for cluster in support_clusters:
+                cluster_avg = sum(s["price"] for s in cluster) / len(cluster)
+                if abs(price - cluster_avg) / cluster_avg <= tolerance:
+                    cluster.append(swing)
+                    added_to_cluster = True
+                    break
+
+            # Create new cluster if not added
+            if not added_to_cluster:
+                support_clusters.append([swing])
+
+        # Find clusters with 3+ tests
+        for cluster in support_clusters:
+            if len(cluster) >= 3:
+                # Check if volumes are declining (accumulation signature)
+                volumes = [s["volume"] for s in cluster]
+                volume_declining = all(volumes[i] > volumes[i+1] for i in range(len(volumes)-1))
+
+                support_level = sum(s["price"] for s in cluster) / len(cluster)
+                return {
+                    "pattern": "accumulation",
+                    "support_level": round(support_level, 2),
+                    "test_count": len(cluster),
+                    "volume_declining": volume_declining
+                }
+
+        return None
+
+    def _detect_failed_breakout(self, ohlcv_data: List[List], swing_highs: List[Dict], swing_lows: List[Dict]) -> Optional[Dict]:
+        """Detect failed breakouts (bull traps and bear traps)"""
+        if len(ohlcv_data) < 5:
+            return None
+
+        # Look at recent candles (last 10)
+        recent_candles = ohlcv_data[-10:]
+
+        # Get recent resistance and support levels
+        if not swing_highs and not swing_lows:
+            return None
+
+        # Check for bull trap (break above resistance then immediate reversal)
+        if swing_highs:
+            recent_resistance = max(s["price"] for s in swing_highs[-3:]) if len(swing_highs) >= 3 else swing_highs[-1]["price"]
+
+            for i in range(len(recent_candles) - 3):
+                high = recent_candles[i][2]
+                close = recent_candles[i][4]
+
+                # Check if broke above resistance
+                if high > recent_resistance * 1.005:  # 0.5% above resistance
+                    # Check if next 1-3 candles reversed back below
+                    for j in range(i+1, min(i+4, len(recent_candles))):
+                        if recent_candles[j][4] < recent_resistance * 0.995:  # Closed back below
+                            return {
+                                "pattern": "failed_breakout",
+                                "type": "bull_trap",
+                                "trap_level": round(recent_resistance, 2)
+                            }
+
+        # Check for bear trap (break below support then immediate reversal)
+        if swing_lows:
+            recent_support = min(s["price"] for s in swing_lows[-3:]) if len(swing_lows) >= 3 else swing_lows[-1]["price"]
+
+            for i in range(len(recent_candles) - 3):
+                low = recent_candles[i][3]
+                close = recent_candles[i][4]
+
+                # Check if broke below support
+                if low < recent_support * 0.995:  # 0.5% below support
+                    # Check if next 1-3 candles reversed back above
+                    for j in range(i+1, min(i+4, len(recent_candles))):
+                        if recent_candles[j][4] > recent_support * 1.005:  # Closed back above
+                            return {
+                                "pattern": "failed_breakout",
+                                "type": "bear_trap",
+                                "trap_level": round(recent_support, 2)
+                            }
+
+        return None
+
+    def analyze_liquidity_zones(self, ohlcv_data: List[List], current_price: float, volume_24h: float) -> Dict:
+        """
+        Analyze support/resistance levels and volume to identify potential liquidity zones.
+
+        Args:
+            ohlcv_data: OHLCV candle data [timestamp, open, high, low, close, volume]
+            current_price: Current BTC price
+            volume_24h: 24-hour volume
+
+        Returns:
+            Dictionary with liquidity analysis including support/resistance levels and volume metrics
+        """
+        if not ohlcv_data or len(ohlcv_data) < 20 or current_price <= 0:
+            return {
+                "nearest_support": None,
+                "nearest_resistance": None,
+                "distance_to_support_pct": None,
+                "distance_to_resistance_pct": None,
+                "volume_ratio": None,
+                "volume_spike": False,
+                "potential_liquidity_zone": False
+            }
+
+        # Extract high, low, and volume from OHLCV data
+        highs = [candle[2] for candle in ohlcv_data]  # High prices
+        lows = [candle[3] for candle in ohlcv_data]   # Low prices
+        volumes = [candle[5] for candle in ohlcv_data]  # Volumes
+
+        # Find swing highs (resistance levels)
+        # A swing high is a high that's higher than the 2 candles before and after it
+        swing_highs = []
+        for i in range(2, len(highs) - 2):
+            if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
+                highs[i] > highs[i+1] and highs[i] > highs[i+2]):
+                swing_highs.append(highs[i])
+
+        # Find swing lows (support levels)
+        # A swing low is a low that's lower than the 2 candles before and after it
+        swing_lows = []
+        for i in range(2, len(lows) - 2):
+            if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and
+                lows[i] < lows[i+1] and lows[i] < lows[i+2]):
+                swing_lows.append(lows[i])
+
+        # Find nearest support (highest swing low below current price)
+        nearest_support = None
+        supports_below = [level for level in swing_lows if level < current_price]
+        if supports_below:
+            nearest_support = max(supports_below)
+
+        # Find nearest resistance (lowest swing high above current price)
+        nearest_resistance = None
+        resistances_above = [level for level in swing_highs if level > current_price]
+        if resistances_above:
+            nearest_resistance = min(resistances_above)
+
+        # Calculate distance to support/resistance as percentage
+        distance_to_support_pct = None
+        if nearest_support:
+            distance_to_support_pct = round(((current_price - nearest_support) / current_price) * 100, 2)
+
+        distance_to_resistance_pct = None
+        if nearest_resistance:
+            distance_to_resistance_pct = round(((nearest_resistance - current_price) / current_price) * 100, 2)
+
+        # Calculate volume metrics
+        # Use last 20 candles to calculate average volume
+        avg_volume = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else sum(volumes) / len(volumes)
+
+        volume_ratio = None
+        volume_spike = False
+        if avg_volume > 0 and volume_24h > 0:
+            volume_ratio = round(volume_24h / avg_volume, 2)
+            volume_spike = volume_ratio > 2.0  # Spike if volume is >2x average
+
+        # Determine if we're at a potential liquidity zone
+        # Criteria: Close to support/resistance (within 5%) OR volume spike
+        potential_liquidity_zone = False
+        if distance_to_support_pct and distance_to_support_pct < 5.0:
+            potential_liquidity_zone = True
+        elif distance_to_resistance_pct and distance_to_resistance_pct < 5.0:
+            potential_liquidity_zone = True
+        elif volume_spike:
+            potential_liquidity_zone = True
+
+        return {
+            "nearest_support": round(nearest_support, 2) if nearest_support else None,
+            "nearest_resistance": round(nearest_resistance, 2) if nearest_resistance else None,
+            "distance_to_support_pct": distance_to_support_pct,
+            "distance_to_resistance_pct": distance_to_resistance_pct,
+            "volume_ratio": volume_ratio,
+            "volume_spike": volume_spike,
+            "potential_liquidity_zone": potential_liquidity_zone
+        }
+
     def fetch_market_data(self) -> MarketData:
         """Fetch comprehensive market data including technical indicators"""
         exchange_error = None
@@ -301,6 +783,12 @@ class MarketDataFetcher:
                 if sma_50:
                     price_vs_sma50 = "above" if current_price > sma_50 else "below"
 
+            # Analyze liquidity zones (support/resistance and volume)
+            liquidity_analysis = self.analyze_liquidity_zones(ohlcv, current_price, volume_24h)
+
+            # Detect Wyckoff patterns (accumulation/distribution)
+            wyckoff_pattern = self.detect_wyckoff_patterns(ohlcv)
+
             # Fetch Fear & Greed Index
             fear_greed_value, fear_greed_class, fear_greed_error = self.get_fear_greed_index()
 
@@ -320,6 +808,15 @@ class MarketDataFetcher:
                 ema_9=ema_9,
                 price_vs_sma20=price_vs_sma20,
                 price_vs_sma50=price_vs_sma50,
+                nearest_support=liquidity_analysis["nearest_support"],
+                nearest_resistance=liquidity_analysis["nearest_resistance"],
+                distance_to_support_pct=liquidity_analysis["distance_to_support_pct"],
+                distance_to_resistance_pct=liquidity_analysis["distance_to_resistance_pct"],
+                volume_ratio=liquidity_analysis["volume_ratio"],
+                volume_spike=liquidity_analysis["volume_spike"],
+                potential_liquidity_zone=liquidity_analysis["potential_liquidity_zone"],
+                wyckoff_pattern=wyckoff_pattern.get("pattern"),
+                wyckoff_details=wyckoff_pattern if wyckoff_pattern.get("pattern") != "none" else None,
                 exchange_available=True,
                 exchange_name=self.exchange_name,
                 exchange_error=None,
@@ -546,7 +1043,7 @@ class BitcoinSentimentAnalyzer:
     def __init__(self, ollama_client: OllamaClient):
         self.ollama = ollama_client
 
-    def analyze_articles(self, articles: List[NewsArticle], market_data: Optional[MarketData] = None) -> SentimentAnalysis:
+    def analyze_articles(self, articles: List[NewsArticle], market_data: Optional[MarketData] = None, reversal_signal: Optional[Dict] = None) -> SentimentAnalysis:
         """Analyze sentiment from multiple news articles and market data"""
         if not articles:
             return SentimentAnalysis(
@@ -587,6 +1084,60 @@ Current Market Data:
             if market_data.sma_50:
                 market_context += f"- SMA(50): ${market_data.sma_50:,.2f} (Price is {market_data.price_vs_sma50})\n"
 
+            # Liquidity zones (support/resistance and volume analysis)
+            if market_data.nearest_support or market_data.nearest_resistance:
+                market_context += "\nLiquidity Zones:\n"
+                if market_data.nearest_support:
+                    market_context += f"- Nearest Support: ${market_data.nearest_support:,.2f} ({market_data.distance_to_support_pct:.2f}% below)\n"
+                if market_data.nearest_resistance:
+                    market_context += f"- Nearest Resistance: ${market_data.nearest_resistance:,.2f} ({market_data.distance_to_resistance_pct:.2f}% above)\n"
+                if market_data.volume_ratio:
+                    volume_status = "SPIKE" if market_data.volume_spike else "Normal"
+                    market_context += f"- Volume vs 20-day Avg: {market_data.volume_ratio}x ({volume_status})\n"
+                if market_data.potential_liquidity_zone:
+                    market_context += "- ⚠️ AT POTENTIAL LIQUIDITY ZONE - High probability of price reaction\n"
+
+            # Wyckoff pattern analysis
+            if market_data.wyckoff_pattern and market_data.wyckoff_pattern != "none":
+                market_context += "\n📊 WYCKOFF PATTERN DETECTED:\n"
+                if market_data.wyckoff_pattern == "distribution":
+                    details = market_data.wyckoff_details
+                    market_context += f"- Pattern: DISTRIBUTION (Bearish)\n"
+                    market_context += f"- Resistance Level: ${details['resistance_level']:,.2f} tested {details['test_count']} times\n"
+                    if details['volume_declining']:
+                        market_context += "- Volume declining on tests (classic distribution signature)\n"
+                    market_context += "- Indicates smart money selling into strength - Bearish signal\n"
+                elif market_data.wyckoff_pattern == "accumulation":
+                    details = market_data.wyckoff_details
+                    market_context += f"- Pattern: ACCUMULATION (Bullish)\n"
+                    market_context += f"- Support Level: ${details['support_level']:,.2f} tested {details['test_count']} times\n"
+                    if details['volume_declining']:
+                        market_context += "- Volume declining on tests (classic accumulation signature)\n"
+                    market_context += "- Indicates smart money buying into weakness - Bullish signal\n"
+                elif market_data.wyckoff_pattern == "failed_breakout":
+                    details = market_data.wyckoff_details
+                    if details['type'] == "bull_trap":
+                        market_context += f"- Pattern: BULL TRAP (Bearish)\n"
+                        market_context += f"- Failed breakout above ${details['trap_level']:,.2f}\n"
+                        market_context += "- Liquidity grab above resistance, likely to reverse down\n"
+                    elif details['type'] == "bear_trap":
+                        market_context += f"- Pattern: BEAR TRAP (Bullish)\n"
+                        market_context += f"- Failed breakdown below ${details['trap_level']:,.2f}\n"
+                        market_context += "- Liquidity grab below support, likely to reverse up\n"
+
+        # Add reversal context if provided
+        reversal_context = ""
+        if reversal_signal and reversal_signal.get("type") != "none":
+            reversal_context = "\n⚠️ REVERSAL SIGNAL DETECTED:\n"
+            if reversal_signal["type"] == "oversold_bounce":
+                reversal_context += f"- Type: OVERSOLD BOUNCE (Potential Bottom)\n"
+                reversal_context += f"- Strength: {reversal_signal['strength'].upper()}\n"
+                reversal_context += "- Extreme fear + oversold conditions often precede price bounces\n"
+            elif reversal_signal["type"] == "overbought_reversal":
+                reversal_context += f"- Type: OVERBOUGHT REVERSAL (Potential Top)\n"
+                reversal_context += f"- Strength: {reversal_signal['strength'].upper()}\n"
+                reversal_context += "- Extreme greed + overbought conditions often precede corrections\n"
+
         # Create analysis prompt
         system_prompt = """You are an expert Bitcoin trading analyst. Analyze news articles and market data to provide sentiment analysis in JSON format.
 Your response must be valid JSON with this structure:
@@ -597,12 +1148,17 @@ Your response must be valid JSON with this structure:
     "reasoning": "<detailed explanation>"
 }
 
-Consider both the news sentiment and technical indicators (RSI, moving averages, Fear & Greed Index) in your analysis."""
+Consider the news sentiment, technical indicators (RSI, moving averages, Fear & Greed Index), liquidity zones (support/resistance levels), volume analysis, Wyckoff patterns, and any reversal signals in your analysis.
+Reversal signals and liquidity zones are important as they often precede significant price movements.
+Wyckoff patterns indicate smart money activity: Distribution (bearish - selling into strength), Accumulation (bullish - buying into weakness), and Failed Breakouts (traps/liquidity grabs).
+When price is near support with high volume, it may indicate capitulation and a buying opportunity.
+When price is near resistance, it may face selling pressure."""
 
         prompt = f"""Analyze the following Bitcoin news articles and market data to determine the overall market sentiment:
 
 {articles_text}
 {market_context}
+{reversal_context}
 
 Provide your analysis in JSON format as specified."""
 
@@ -670,6 +1226,43 @@ class BitcoinTradingAdvisor:
     def __init__(self, ollama_client: OllamaClient):
         self.ollama = ollama_client
 
+    def detect_reversal_conditions(self, market_data: Optional[MarketData] = None) -> Dict:
+        """
+        Detect potential reversal conditions based on extreme RSI and Fear & Greed values.
+
+        Returns:
+            Dict with keys:
+                - type: "oversold_bounce", "overbought_reversal", or "none"
+                - strength: "strong", "moderate", "weak" (only if reversal detected)
+        """
+        if not market_data or not market_data.rsi_14 or not market_data.fear_greed_index:
+            return {"type": "none"}
+
+        rsi = market_data.rsi_14
+        fear_greed = market_data.fear_greed_index
+
+        # Oversold Reversal (potential bottom)
+        if rsi < 30 and fear_greed < 25:
+            # Both extremely oversold - strong reversal signal
+            if rsi < 25 and fear_greed < 20:
+                return {"type": "oversold_bounce", "strength": "strong"}
+            elif rsi < 27 or fear_greed < 22:
+                return {"type": "oversold_bounce", "strength": "moderate"}
+            else:
+                return {"type": "oversold_bounce", "strength": "weak"}
+
+        # Overbought Reversal (potential top)
+        elif rsi > 70 and fear_greed > 75:
+            # Both extremely overbought - strong reversal signal
+            if rsi > 75 and fear_greed > 80:
+                return {"type": "overbought_reversal", "strength": "strong"}
+            elif rsi > 72 or fear_greed > 77:
+                return {"type": "overbought_reversal", "strength": "moderate"}
+            else:
+                return {"type": "overbought_reversal", "strength": "weak"}
+
+        return {"type": "none"}
+
     def generate_recommendation(
         self,
         sentiment: SentimentAnalysis,
@@ -679,6 +1272,9 @@ class BitcoinTradingAdvisor:
         market_data: Optional[MarketData] = None
     ) -> TradingRecommendation:
         """Generate trading recommendation based on sentiment and market data"""
+
+        # Detect reversal conditions first
+        reversal = self.detect_reversal_conditions(market_data)
 
         system_prompt = """You are an expert Bitcoin trading advisor. Generate trading recommendations in JSON format.
 Your response must be valid JSON with this structure:
@@ -692,7 +1288,11 @@ Your response must be valid JSON with this structure:
     "reasoning": "<detailed explanation>"
 }
 
-Use technical indicators (RSI, moving averages) and market sentiment (Fear & Greed) to inform your decision."""
+Use technical indicators (RSI, moving averages), market sentiment (Fear & Greed), liquidity zones (support/resistance), volume analysis, Wyckoff patterns, and reversal signals to inform your decision.
+Pay special attention to reversal conditions, Wyckoff patterns, and liquidity zones as they often precede significant price movements.
+Wyckoff patterns reveal smart money activity: Distribution (bearish), Accumulation (bullish), Failed Breakouts (traps).
+Use support levels for stop-loss placement and resistance levels for take-profit targets.
+Consider volume spikes as potential capitulation or exhaustion signals."""
 
         # Prepare market data context
         market_context = ""
@@ -724,6 +1324,56 @@ Use technical indicators (RSI, moving averages) and market sentiment (Fear & Gre
             if market_data.price_change_percentage_24h != 0:
                 market_context += f"- 24h Price Change: {market_data.price_change_percentage_24h:+.2f}%\n"
 
+            # Liquidity zones
+            if market_data.nearest_support or market_data.nearest_resistance:
+                market_context += "\nLiquidity Zones & Market Structure:\n"
+                if market_data.nearest_support:
+                    market_context += f"- Nearest Support: ${market_data.nearest_support:,.2f} ({market_data.distance_to_support_pct:.2f}% below) - Consider for stop-loss\n"
+                if market_data.nearest_resistance:
+                    market_context += f"- Nearest Resistance: ${market_data.nearest_resistance:,.2f} ({market_data.distance_to_resistance_pct:.2f}% above) - Consider for take-profit\n"
+                if market_data.volume_ratio:
+                    volume_status = "HIGH VOLUME SPIKE" if market_data.volume_spike else "Normal"
+                    market_context += f"- Volume vs 20-day Avg: {market_data.volume_ratio}x ({volume_status})\n"
+                if market_data.potential_liquidity_zone:
+                    market_context += "- ⚠️ AT LIQUIDITY ZONE - Price likely to react here (bounce or break)\n"
+
+            # Wyckoff pattern analysis
+            if market_data.wyckoff_pattern and market_data.wyckoff_pattern != "none":
+                market_context += "\n📊 WYCKOFF PATTERN DETECTED:\n"
+                if market_data.wyckoff_pattern == "distribution":
+                    details = market_data.wyckoff_details
+                    market_context += f"- Pattern: DISTRIBUTION (BEARISH - Smart Money Selling)\n"
+                    market_context += f"- Resistance: ${details['resistance_level']:,.2f} tested {details['test_count']}x\n"
+                    market_context += "- Consider this a SELL signal or avoid buying\n"
+                elif market_data.wyckoff_pattern == "accumulation":
+                    details = market_data.wyckoff_details
+                    market_context += f"- Pattern: ACCUMULATION (BULLISH - Smart Money Buying)\n"
+                    market_context += f"- Support: ${details['support_level']:,.2f} tested {details['test_count']}x\n"
+                    market_context += "- Consider this a BUY signal\n"
+                elif market_data.wyckoff_pattern == "failed_breakout":
+                    details = market_data.wyckoff_details
+                    if details['type'] == "bull_trap":
+                        market_context += f"- Pattern: BULL TRAP (BEARISH)\n"
+                        market_context += f"- Failed breakout at ${details['trap_level']:,.2f}\n"
+                        market_context += "- Expect reversal DOWN - Bearish signal\n"
+                    elif details['type'] == "bear_trap":
+                        market_context += f"- Pattern: BEAR TRAP (BULLISH)\n"
+                        market_context += f"- Failed breakdown at ${details['trap_level']:,.2f}\n"
+                        market_context += "- Expect reversal UP - Bullish signal\n"
+
+        # Add reversal context
+        reversal_context = ""
+        if reversal["type"] != "none":
+            reversal_context = f"\n⚠️ REVERSAL SIGNAL DETECTED:\n"
+            if reversal["type"] == "oversold_bounce":
+                reversal_context += f"- Type: OVERSOLD BOUNCE (Potential Bottom)\n"
+                reversal_context += f"- Strength: {reversal['strength'].upper()}\n"
+                reversal_context += f"- Market is in extreme fear with oversold RSI - potential buying opportunity\n"
+            elif reversal["type"] == "overbought_reversal":
+                reversal_context += f"- Type: OVERBOUGHT REVERSAL (Potential Top)\n"
+                reversal_context += f"- Strength: {reversal['strength'].upper()}\n"
+                reversal_context += f"- Market is in extreme greed with overbought RSI - potential selling opportunity\n"
+
         prompt = f"""Based on the following sentiment analysis and market data, generate a trading recommendation for Bitcoin:
 
 Sentiment Analysis:
@@ -737,12 +1387,15 @@ Current Market Conditions:
 - Portfolio Value: ${portfolio_value:,.2f}
 - Risk Tolerance: {risk_tolerance}
 {market_context}
+{reversal_context}
 
 Provide a trading recommendation with proper risk management (stop loss, take profit, position sizing).
 Consider the risk tolerance when determining position size:
 - Low risk: 1-3% of portfolio
 - Medium risk: 3-7% of portfolio
 - High risk: 7-15% of portfolio
+
+IMPORTANT: If a reversal signal is detected, consider it carefully in your recommendation as these often precede significant price movements.
 
 Provide your recommendation in JSON format as specified."""
 
@@ -918,6 +1571,34 @@ class BitcoinTradingBot:
             if market_data.ema_9:
                 indicators.append(f"EMA(9): ${market_data.ema_9:,.2f}")
             print(f"Short-term MAs: {', '.join(indicators)}")
+
+        # Display liquidity zone information if available
+        if market_data.nearest_support or market_data.nearest_resistance:
+            print()
+            print("Liquidity Zones:")
+            if market_data.nearest_support:
+                print(f"  Support: ${market_data.nearest_support:,.2f} ({market_data.distance_to_support_pct:.2f}% below)")
+            if market_data.nearest_resistance:
+                print(f"  Resistance: ${market_data.nearest_resistance:,.2f} ({market_data.distance_to_resistance_pct:.2f}% above)")
+            if market_data.volume_ratio:
+                volume_status = "SPIKE" if market_data.volume_spike else "Normal"
+                print(f"  Volume: {market_data.volume_ratio:.2f}x 20-day avg ({volume_status})")
+            if market_data.potential_liquidity_zone:
+                print(f"  ⚠️ AT LIQUIDITY ZONE")
+        print()
+
+        # Detect reversal conditions (after technical indicators are calculated)
+        print("Detecting reversal conditions...")
+        reversal_signal = self.trading_advisor.detect_reversal_conditions(market_data)
+        if reversal_signal["type"] != "none":
+            print(f" ⚠️  REVERSAL SIGNAL DETECTED!")
+            if reversal_signal["type"] == "oversold_bounce":
+                print(f"  - Type: OVERSOLD BOUNCE (Potential Bottom)")
+            elif reversal_signal["type"] == "overbought_reversal":
+                print(f"  - Type: OVERBOUGHT REVERSAL (Potential Top)")
+            print(f"  - Strength: {reversal_signal['strength'].upper()}")
+        else:
+            print(f" No reversal conditions detected")
         print()
 
         # Fetch news articles
@@ -935,9 +1616,9 @@ class BitcoinTradingBot:
                 print(f"     Published {time_str} | Source: {article.source}")
             print()
 
-        # Analyze sentiment
+        # Analyze sentiment (including reversal signal)
         print("Analyzing sentiment with AI...")
-        sentiment = self.sentiment_analyzer.analyze_articles(articles, market_data)
+        sentiment = self.sentiment_analyzer.analyze_articles(articles, market_data, reversal_signal)
         print(f" Sentiment Analysis Complete")
         print(f"  - Sentiment: {sentiment.sentiment.upper()}")
         print(f"  - Confidence: {sentiment.confidence:.1f}%")
@@ -951,6 +1632,79 @@ class BitcoinTradingBot:
         print(f" Recommendation Generated")
         print(f"  - Action: {recommendation.action.upper()}")
         print(f"  - Confidence: {recommendation.confidence:.1f}%")
+        print()
+
+        # Calculate hybrid stop-loss with ATR and leverage optimization
+        print("Calculating hybrid stop-loss and leverage optimization...")
+        hybrid_stop = None
+        blocked_recommendation = None
+        if recommendation.action.lower() in ["buy", "sell"] and market_data.exchange_available:
+            # Fetch OHLCV data for ATR calculation
+            ohlcv = self.market_data_fetcher.get_btc_ohlcv(timeframe='1d', limit=100)
+            if ohlcv:
+                hybrid_stop = self.market_data_fetcher.calculate_hybrid_stop_loss(
+                    ohlcv_data=ohlcv,
+                    entry_price=recommendation.entry_price or current_price,
+                    target_price=recommendation.take_profit,
+                    action=recommendation.action,
+                    portfolio_value=portfolio_value
+                )
+                if hybrid_stop and hybrid_stop.get("atr_value"):
+                    print(f"  Hybrid Stop-Loss Calculated")
+                    print(f"  - ATR(14): ${hybrid_stop['atr_value']:,.2f}")
+                    print(f"  - ATR Stop Loss: ${hybrid_stop['atr_stop_loss']:,.2f}")
+                    if hybrid_stop.get('risk_reward_ratio'):
+                        rr_status = "GOOD" if hybrid_stop['meets_rr_minimum'] else "LOW"
+                        print(f"  - Risk/Reward: 1:{hybrid_stop['risk_reward_ratio']} ({rr_status})")
+                    print(f"  - Recommended Leverage: {hybrid_stop['recommended_leverage']}x")
+                    print(f"  - Max Safe Position: {hybrid_stop['max_safe_position_pct']:.1f}%")
+
+                    # Safety filter: Block trades with poor R/R ratio
+                    if hybrid_stop.get('risk_reward_ratio') and not hybrid_stop['meets_rr_minimum']:
+                        print()
+                        print(f"  ⚠️  TRADE BLOCKED: Risk/Reward ratio too low ({hybrid_stop['risk_reward_ratio']}:1 < 1:2 minimum)")
+
+                        # Save original recommendation
+                        blocked_recommendation = {
+                            "action": recommendation.action,
+                            "confidence": recommendation.confidence,
+                            "entry_price": recommendation.entry_price,
+                            "stop_loss": recommendation.stop_loss,
+                            "take_profit": recommendation.take_profit,
+                            "reasoning": recommendation.reasoning
+                        }
+
+                        # Calculate required target for minimum R/R
+                        entry = recommendation.entry_price or current_price
+                        atr_stop = hybrid_stop['atr_stop_loss']
+                        risk_amount = abs(entry - atr_stop)
+                        required_profit = risk_amount * 2.0  # 1:2 minimum
+
+                        if recommendation.action.lower() == "buy":
+                            required_target = entry + required_profit
+                        else:  # sell
+                            required_target = entry - required_profit
+
+                        # Override recommendation to HOLD
+                        new_reasoning = (
+                            f"Trade blocked - Risk/Reward ratio of {hybrid_stop['risk_reward_ratio']}:1 is below the 1:2 minimum threshold. "
+                            f"The ATR-based stop loss at ${atr_stop:,.2f} would require a target of ${required_target:,.2f} to meet minimum R/R. "
+                            f"Current target of ${recommendation.take_profit:,.2f} is insufficient. Waiting for better setup with improved risk/reward."
+                        )
+
+                        # Create new recommendation object with HOLD action
+                        recommendation = TradingRecommendation(
+                            action="hold",
+                            confidence=recommendation.confidence * 0.5,  # Reduce confidence
+                            entry_price=None,
+                            stop_loss=None,
+                            take_profit=None,
+                            position_size_percentage=0.0,
+                            reasoning=new_reasoning
+                        )
+
+                        print(f"  - Required target for 1:2 R/R: ${required_target:,.2f}")
+                        print(f"  - Recommendation changed to: HOLD")
         print()
 
         # Calculate position size
@@ -1016,8 +1770,18 @@ class BitcoinTradingBot:
                 "sma_20": market_data.sma_20,
                 "sma_50": market_data.sma_50,
                 "price_vs_sma20": market_data.price_vs_sma20,
-                "price_vs_sma50": market_data.price_vs_sma50
+                "price_vs_sma50": market_data.price_vs_sma50,
+                "nearest_support": market_data.nearest_support,
+                "nearest_resistance": market_data.nearest_resistance,
+                "distance_to_support_pct": market_data.distance_to_support_pct,
+                "distance_to_resistance_pct": market_data.distance_to_resistance_pct,
+                "volume_ratio": market_data.volume_ratio,
+                "volume_spike": market_data.volume_spike,
+                "potential_liquidity_zone": market_data.potential_liquidity_zone,
+                "wyckoff_pattern": market_data.wyckoff_pattern,
+                "wyckoff_details": market_data.wyckoff_details
             },
+            "reversal_signal": reversal_signal,
             "sentiment": {
                 "sentiment": sentiment.sentiment,
                 "confidence": sentiment.confidence,
@@ -1032,7 +1796,9 @@ class BitcoinTradingBot:
                 "take_profit": recommendation.take_profit,
                 "reasoning": recommendation.reasoning
             },
-            "position_sizing": position_details
+            "position_sizing": position_details,
+            "hybrid_stop_loss": hybrid_stop if hybrid_stop else None,
+            "blocked_recommendation": blocked_recommendation if blocked_recommendation else None
         }
 
         # Display results
@@ -1062,6 +1828,20 @@ class BitcoinTradingBot:
         print("ANALYSIS RESULTS")
         print("=" * 80)
         print()
+
+        # Display reversal signal if present
+        if "reversal_signal" in results and results["reversal_signal"]["type"] != "none":
+            print("⚠️  REVERSAL SIGNAL")
+            print("-" * 80)
+            reversal = results["reversal_signal"]
+            if reversal["type"] == "oversold_bounce":
+                print("Type: OVERSOLD BOUNCE (Potential Bottom)")
+                print("Description: Extreme fear + oversold RSI often precede price bounces")
+            elif reversal["type"] == "overbought_reversal":
+                print("Type: OVERBOUGHT REVERSAL (Potential Top)")
+                print("Description: Extreme greed + overbought RSI often precede corrections")
+            print(f"Strength: {reversal['strength'].upper()}")
+            print()
 
         # Display market data first (only if we have valid data)
         if "market_data" in results:
@@ -1102,6 +1882,46 @@ class BitcoinTradingBot:
 
                 if mkt.get('sma_50'):
                     print(f"SMA(50): ${mkt['sma_50']:,.2f} (Price is {mkt['price_vs_sma50']})")
+
+                # Liquidity zones section
+                if mkt.get('nearest_support') or mkt.get('nearest_resistance'):
+                    print()
+                    print("Liquidity Zones & Market Structure:")
+                    if mkt.get('nearest_support'):
+                        print(f"  Support: ${mkt['nearest_support']:,.2f} ({mkt['distance_to_support_pct']:.2f}% below)")
+                    if mkt.get('nearest_resistance'):
+                        print(f"  Resistance: ${mkt['nearest_resistance']:,.2f} ({mkt['distance_to_resistance_pct']:.2f}% above)")
+                    if mkt.get('volume_ratio'):
+                        volume_status = "SPIKE" if mkt.get('volume_spike') else "Normal"
+                        print(f"  Volume vs 20-day Avg: {mkt['volume_ratio']:.2f}x ({volume_status})")
+                    if mkt.get('potential_liquidity_zone'):
+                        print(f"  ⚠️ AT LIQUIDITY ZONE - High probability of price reaction")
+
+                # Wyckoff pattern section
+                if mkt.get('wyckoff_pattern') and mkt['wyckoff_pattern'] != "none":
+                    print()
+                    print("📊 Wyckoff Pattern:")
+                    details = mkt.get('wyckoff_details', {})
+                    if mkt['wyckoff_pattern'] == "distribution":
+                        print(f"  Pattern: DISTRIBUTION (BEARISH)")
+                        print(f"  Resistance: ${details.get('resistance_level', 0):,.2f} tested {details.get('test_count', 0)}x")
+                        if details.get('volume_declining'):
+                            print(f"  Volume: Declining (classic distribution)")
+                        print(f"  Signal: Smart money selling - BEARISH")
+                    elif mkt['wyckoff_pattern'] == "accumulation":
+                        print(f"  Pattern: ACCUMULATION (BULLISH)")
+                        print(f"  Support: ${details.get('support_level', 0):,.2f} tested {details.get('test_count', 0)}x")
+                        if details.get('volume_declining'):
+                            print(f"  Volume: Declining (classic accumulation)")
+                        print(f"  Signal: Smart money buying - BULLISH")
+                    elif mkt['wyckoff_pattern'] == "failed_breakout":
+                        trap_type = details.get('type', '').upper()
+                        print(f"  Pattern: {trap_type}")
+                        print(f"  Trap Level: ${details.get('trap_level', 0):,.2f}")
+                        if details.get('type') == "bull_trap":
+                            print(f"  Signal: Failed breakout - BEARISH")
+                        else:
+                            print(f"  Signal: Failed breakdown - BULLISH")
 
                 print()
 
@@ -1144,6 +1964,33 @@ class BitcoinTradingBot:
                 risk_reward = pos['potential_profit_usd'] / pos['max_loss_usd']
                 print(f"Risk/Reward Ratio: 1:{risk_reward:.2f}")
         print()
+
+        # Display hybrid stop-loss analysis if available
+        if "hybrid_stop_loss" in results and results["hybrid_stop_loss"]:
+            hybrid = results["hybrid_stop_loss"]
+            if hybrid.get("atr_value"):
+                print("HYBRID STOP-LOSS & LEVERAGE ANALYSIS")
+                print("-" * 80)
+                print(f"ATR(14): ${hybrid['atr_value']:,.2f}")
+                print(f"ATR-Based Stop Loss: ${hybrid['atr_stop_loss']:,.2f}")
+
+                if hybrid.get('risk_reward_ratio'):
+                    rr_status = "MEETS MINIMUM" if hybrid['meets_rr_minimum'] else "BELOW MINIMUM"
+                    print(f"Risk/Reward Ratio: 1:{hybrid['risk_reward_ratio']} ({rr_status})")
+
+                print(f"\nRecommended Leverage: {hybrid['recommended_leverage']}x")
+                print(f"Max Safe Position Size: {hybrid['max_safe_position_pct']:.1f}%")
+
+                # Display leverage analysis table
+                if hybrid.get('leverage_analysis'):
+                    print("\nLeverage Safety Analysis:")
+                    print(f"  {'Leverage':<10} {'Liq Price':<15} {'Safe':<8} {'Max Position'}")
+                    print("  " + "-" * 50)
+                    for lev, analysis in hybrid['leverage_analysis'].items():
+                        liq_str = f"${analysis['liq_price']:,.0f}" if analysis['liq_price'] else "None"
+                        safe_str = "Yes" if analysis['safe'] else "No"
+                        print(f"  {lev:<10} {liq_str:<15} {safe_str:<8} {analysis['max_position']:.1f}%")
+                print()
 
     def _determine_mode(self, market_data) -> str:
         """Determine analysis mode based on available data"""
