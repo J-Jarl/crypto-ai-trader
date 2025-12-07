@@ -157,17 +157,57 @@ class MarketDataFetcher:
     """Fetches real-time market data and calculates technical indicators"""
 
     def __init__(self):
-        # Use Coinbase as primary, with Kraken as fallback
+        # Try exchanges in order: Coinbase -> Kraken -> Binance.US -> CoinGecko (API only)
+        self.exchange = None
+        self.exchange_name = "None"
+        self.exchanges_tried = []
+
+        # Try Coinbase
         try:
             self.exchange = ccxt.coinbase()
             self.exchange_name = "Coinbase"
-        except Exception:
+            self.exchanges_tried.append("Coinbase: Success")
+        except Exception as e:
+            self.exchanges_tried.append(f"Coinbase: {str(e)[:50]}")
+
+            # Try Kraken
             try:
                 self.exchange = ccxt.kraken()
                 self.exchange_name = "Kraken"
-            except Exception:
-                self.exchange = None
-                self.exchange_name = "None"
+                self.exchanges_tried.append("Kraken: Success")
+            except Exception as e2:
+                self.exchanges_tried.append(f"Kraken: {str(e2)[:50]}")
+
+                # Try Binance.US
+                try:
+                    self.exchange = ccxt.binanceus()
+                    self.exchange_name = "Binance.US"
+                    self.exchanges_tried.append("Binance.US: Success")
+                except Exception as e3:
+                    self.exchanges_tried.append(f"Binance.US: {str(e3)[:50]}")
+                    # CoinGecko will be tried as final fallback in fetch methods
+                    self.exchange = None
+                    self.exchange_name = "None"
+
+    def get_coingecko_data(self) -> Optional[Dict]:
+        """Fetch BTC price data from CoinGecko API (final fallback, no auth needed)"""
+        try:
+            url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true"
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("bitcoin"):
+                btc_data = data["bitcoin"]
+                return {
+                    "price": btc_data.get("usd", 0),
+                    "volume_24h": btc_data.get("usd_24h_vol", 0),
+                    "price_change_percentage_24h": btc_data.get("usd_24h_change", 0)
+                }
+            return None
+        except Exception as e:
+            print(f"CoinGecko API failed: {str(e)}")
+            return None
 
     def get_fear_greed_index(self) -> tuple[Optional[int], Optional[str], Optional[str]]:
         """Fetch Fear & Greed Index from Alternative.me API"""
@@ -190,21 +230,100 @@ class MarketDataFetcher:
         except Exception as e:
             return None, None, str(e)
 
-    def get_btc_ohlcv(self, timeframe: str = '1h', limit: int = 100) -> List[List]:
-        """Fetch OHLCV data from exchange"""
-        if not self.exchange:
-            return []
-
-        try:
-            # Try BTC/USD first (Coinbase), then BTC/USDT (others)
+    def _try_fetch_ticker_with_failover(self) -> Optional[Dict]:
+        """Try fetching ticker from all exchanges in order, return data with exchange name"""
+        # Try current exchange if available
+        if self.exchange:
             try:
-                ohlcv = self.exchange.fetch_ohlcv('BTC/USD', timeframe=timeframe, limit=limit)
-            except Exception:
-                ohlcv = self.exchange.fetch_ohlcv('BTC/USDT', timeframe=timeframe, limit=limit)
-            return ohlcv
-        except Exception as e:
-            print(f"Error fetching OHLCV data from {self.exchange_name}: {e}")
-            return []
+                # Try BTC/USD first (Coinbase), then BTC/USDT (others)
+                try:
+                    ticker = self.exchange.fetch_ticker('BTC/USD')
+                    return {"ticker": ticker, "exchange": self.exchange_name, "symbol": "BTC/USD"}
+                except Exception:
+                    ticker = self.exchange.fetch_ticker('BTC/USDT')
+                    return {"ticker": ticker, "exchange": self.exchange_name, "symbol": "BTC/USDT"}
+            except Exception as e:
+                print(f"Error fetching ticker from {self.exchange_name}: {str(e)[:50]}")
+
+        # Try other CCXT exchanges in failover order
+        exchanges_to_try = [
+            ('coinbase', 'Coinbase', 'BTC/USD'),
+            ('kraken', 'Kraken', 'BTC/USDT'),
+            ('binanceus', 'Binance.US', 'BTC/USDT')
+        ]
+
+        for exchange_id, exchange_name, symbol in exchanges_to_try:
+            if exchange_name == self.exchange_name:
+                continue  # Already tried above
+
+            try:
+                temp_exchange = getattr(ccxt, exchange_id)()
+                ticker = temp_exchange.fetch_ticker(symbol)
+                print(f"Successfully fetched ticker from fallback: {exchange_name}")
+                return {"ticker": ticker, "exchange": exchange_name, "symbol": symbol}
+            except Exception as e:
+                print(f"Failover {exchange_name} ticker failed: {str(e)[:50]}")
+                continue
+
+        # Final fallback: CoinGecko API
+        print("All CCXT exchanges failed, trying CoinGecko API...")
+        coingecko_data = self.get_coingecko_data()
+        if coingecko_data:
+            # Convert CoinGecko format to ticker-like format
+            print("Successfully fetched data from CoinGecko API")
+            return {
+                "ticker": {
+                    "last": coingecko_data["price"],
+                    "close": coingecko_data["price"],
+                    "change": None,
+                    "percentage": coingecko_data["price_change_percentage_24h"]
+                },
+                "exchange": "CoinGecko",
+                "symbol": "BTC/USD",
+                "volume_24h": coingecko_data["volume_24h"]
+            }
+
+        # All sources failed
+        return None
+
+    def get_btc_ohlcv(self, timeframe: str = '1h', limit: int = 100) -> List[List]:
+        """Fetch OHLCV data from exchange with multi-exchange failover"""
+        # Try current exchange if available
+        if self.exchange:
+            try:
+                # Try BTC/USD first (Coinbase), then BTC/USDT (others)
+                try:
+                    ohlcv = self.exchange.fetch_ohlcv('BTC/USD', timeframe=timeframe, limit=limit)
+                    return ohlcv
+                except Exception:
+                    ohlcv = self.exchange.fetch_ohlcv('BTC/USDT', timeframe=timeframe, limit=limit)
+                    return ohlcv
+            except Exception as e:
+                print(f"Error fetching OHLCV from {self.exchange_name}: {str(e)[:50]}")
+
+        # Try other exchanges in failover order
+        exchanges_to_try = [
+            ('coinbase', 'Coinbase', 'BTC/USD'),
+            ('kraken', 'Kraken', 'BTC/USDT'),
+            ('binanceus', 'Binance.US', 'BTC/USDT')
+        ]
+
+        for exchange_id, exchange_name, symbol in exchanges_to_try:
+            if exchange_name == self.exchange_name:
+                continue  # Already tried above
+
+            try:
+                temp_exchange = getattr(ccxt, exchange_id)()
+                ohlcv = temp_exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+                print(f"Successfully fetched OHLCV from fallback: {exchange_name}")
+                return ohlcv
+            except Exception as e:
+                print(f"Failover {exchange_name} OHLCV failed: {str(e)[:50]}")
+                continue
+
+        # All exchanges failed
+        print("All exchanges failed for OHLCV data - no technical indicators available")
+        return []
 
     def calculate_rsi(self, prices: List[float], period: int = 14) -> Optional[float]:
         """Calculate RSI (Relative Strength Index)"""
@@ -723,29 +842,37 @@ class MarketDataFetcher:
         }
 
     def fetch_market_data(self) -> MarketData:
-        """Fetch comprehensive market data including technical indicators"""
+        """Fetch comprehensive market data including technical indicators with multi-exchange failover"""
         exchange_error = None
         exchange_available = False
 
-        if not self.exchange:
-            exchange_error = "No exchange initialized - Both Coinbase and Kraken failed"
+        # Try to fetch ticker with multi-exchange failover
+        ticker_result = self._try_fetch_ticker_with_failover()
+
+        if not ticker_result:
+            # ALL exchanges failed (including CoinGecko)
+            exchange_error = "All exchange APIs unavailable (Coinbase, Kraken, Binance.US, CoinGecko)"
             return self._get_fallback_market_data(exchange_error)
 
         try:
-            # Fetch ticker data - try BTC/USD first (Coinbase), then BTC/USDT
-            try:
-                ticker = self.exchange.fetch_ticker('BTC/USD')
-            except Exception:
-                ticker = self.exchange.fetch_ticker('BTC/USDT')
+            # Extract ticker data
+            ticker = ticker_result["ticker"]
+            exchange_name = ticker_result["exchange"]
+            symbol = ticker_result["symbol"]
 
             current_price = ticker.get('last', 0) or ticker.get('close', 0)
 
-            # Get 24-hour volume by summing hourly candles
-            try:
-                ohlcv_1h = self.exchange.fetch_ohlcv('BTC/USD', '1h', limit=24)
-                volume_24h = sum(candle[5] for candle in ohlcv_1h) if ohlcv_1h else 0
-            except Exception as e:
-                volume_24h = 0
+            # Get 24-hour volume
+            if "volume_24h" in ticker_result:
+                # CoinGecko provides volume directly
+                volume_24h = ticker_result["volume_24h"]
+            else:
+                # For CCXT exchanges, try to get volume from hourly candles
+                try:
+                    ohlcv_1h = self.get_btc_ohlcv(timeframe='1h', limit=24)
+                    volume_24h = sum(candle[5] for candle in ohlcv_1h) if ohlcv_1h else 0
+                except Exception:
+                    volume_24h = 0
 
             price_change_24h = ticker.get('change', 0) or 0
             price_change_percentage_24h = ticker.get('percentage', 0) or 0
@@ -818,25 +945,16 @@ class MarketDataFetcher:
                 wyckoff_pattern=wyckoff_pattern.get("pattern"),
                 wyckoff_details=wyckoff_pattern if wyckoff_pattern.get("pattern") != "none" else None,
                 exchange_available=True,
-                exchange_name=self.exchange_name,
+                exchange_name=exchange_name,  # Use the exchange that actually worked
                 exchange_error=None,
                 fear_greed_available=fear_greed_value is not None,
                 fear_greed_error=fear_greed_error
             )
 
-        except requests.exceptions.HTTPError as e:
-            if '451' in str(e) or 'Unavailable For Legal Reasons' in str(e):
-                exchange_error = f"{self.exchange_name}: HTTP 451 - Geo-restricted (try VPN or different exchange)"
-            else:
-                exchange_error = f"{self.exchange_name}: HTTP {e.response.status_code} - {str(e)}"
-        except requests.exceptions.Timeout:
-            exchange_error = f"{self.exchange_name}: Timeout - API too slow (check connection)"
-        except requests.exceptions.ConnectionError:
-            exchange_error = f"{self.exchange_name}: Connection error (check internet)"
         except Exception as e:
-            exchange_error = f"{self.exchange_name}: {type(e).__name__} - {str(e)}"
-
-        return self._get_fallback_market_data(exchange_error)
+            # This should rarely happen now since we have multi-exchange failover
+            exchange_error = f"Error processing market data: {type(e).__name__} - {str(e)}"
+            return self._get_fallback_market_data(exchange_error)
 
     def _get_fallback_market_data(self, exchange_error: Optional[str] = None) -> MarketData:
         """Return fallback market data when exchange is unavailable"""
@@ -1584,14 +1702,14 @@ class BitcoinTradingBot:
                 volume_status = "SPIKE" if market_data.volume_spike else "Normal"
                 print(f"  Volume: {market_data.volume_ratio:.2f}x 20-day avg ({volume_status})")
             if market_data.potential_liquidity_zone:
-                print(f"  ⚠️ AT LIQUIDITY ZONE")
+                print(f"  WARNING: AT LIQUIDITY ZONE")
         print()
 
         # Detect reversal conditions (after technical indicators are calculated)
         print("Detecting reversal conditions...")
         reversal_signal = self.trading_advisor.detect_reversal_conditions(market_data)
         if reversal_signal["type"] != "none":
-            print(f" ⚠️  REVERSAL SIGNAL DETECTED!")
+            print(f" WARNING: REVERSAL SIGNAL DETECTED!")
             if reversal_signal["type"] == "oversold_bounce":
                 print(f"  - Type: OVERSOLD BOUNCE (Potential Bottom)")
             elif reversal_signal["type"] == "overbought_reversal":
@@ -1634,10 +1752,45 @@ class BitcoinTradingBot:
         print(f"  - Confidence: {recommendation.confidence:.1f}%")
         print()
 
+        # SAFETY CHECK: Force HOLD if all exchanges failed
+        blocked_recommendation = None
+        if not market_data.exchange_available:
+            print()
+            print("=" * 80)
+            print("CRITICAL SAFETY OVERRIDE")
+            print("=" * 80)
+            print("All exchange APIs unavailable - cannot generate safe trading recommendation")
+            print()
+            print(f"Exchanges tried: {', '.join(self.market_data_fetcher.exchanges_tried)}")
+            print()
+            print("Original recommendation overridden to HOLD for safety")
+            print("=" * 80)
+            print()
+
+            # Save original recommendation
+            blocked_recommendation = {
+                "action": recommendation.action,
+                "confidence": recommendation.confidence,
+                "entry_price": recommendation.entry_price,
+                "stop_loss": recommendation.stop_loss,
+                "take_profit": recommendation.take_profit,
+                "reasoning": recommendation.reasoning
+            }
+
+            # Override to HOLD
+            recommendation = TradingRecommendation(
+                action="hold",
+                confidence=0.0,
+                entry_price=None,
+                stop_loss=None,
+                take_profit=None,
+                position_size_percentage=0.0,
+                reasoning="All exchange APIs unavailable - cannot generate safe trading recommendation with real-time price data"
+            )
+
         # Calculate hybrid stop-loss with ATR and leverage optimization
         print("Calculating hybrid stop-loss and leverage optimization...")
         hybrid_stop = None
-        blocked_recommendation = None
         if recommendation.action.lower() in ["buy", "sell"] and market_data.exchange_available:
             # Fetch OHLCV data for ATR calculation
             ohlcv = self.market_data_fetcher.get_btc_ohlcv(timeframe='1d', limit=100)
@@ -1662,17 +1815,18 @@ class BitcoinTradingBot:
                     # Safety filter: Block trades with poor R/R ratio
                     if hybrid_stop.get('risk_reward_ratio') and not hybrid_stop['meets_rr_minimum']:
                         print()
-                        print(f"  ⚠️  TRADE BLOCKED: Risk/Reward ratio too low ({hybrid_stop['risk_reward_ratio']}:1 < 1:2 minimum)")
+                        print(f"  WARNING: TRADE BLOCKED: Risk/Reward ratio too low ({hybrid_stop['risk_reward_ratio']}:1 < 1:2 minimum)")
 
-                        # Save original recommendation
-                        blocked_recommendation = {
-                            "action": recommendation.action,
-                            "confidence": recommendation.confidence,
-                            "entry_price": recommendation.entry_price,
-                            "stop_loss": recommendation.stop_loss,
-                            "take_profit": recommendation.take_profit,
-                            "reasoning": recommendation.reasoning
-                        }
+                        # Save original recommendation (if not already blocked by exchange failure)
+                        if not blocked_recommendation:
+                            blocked_recommendation = {
+                                "action": recommendation.action,
+                                "confidence": recommendation.confidence,
+                                "entry_price": recommendation.entry_price,
+                                "stop_loss": recommendation.stop_loss,
+                                "take_profit": recommendation.take_profit,
+                                "reasoning": recommendation.reasoning
+                            }
 
                         # Calculate required target for minimum R/R
                         entry = recommendation.entry_price or current_price
@@ -1831,7 +1985,7 @@ class BitcoinTradingBot:
 
         # Display reversal signal if present
         if "reversal_signal" in results and results["reversal_signal"]["type"] != "none":
-            print("⚠️  REVERSAL SIGNAL")
+            print("WARNING: REVERSAL SIGNAL")
             print("-" * 80)
             reversal = results["reversal_signal"]
             if reversal["type"] == "oversold_bounce":
@@ -1895,12 +2049,12 @@ class BitcoinTradingBot:
                         volume_status = "SPIKE" if mkt.get('volume_spike') else "Normal"
                         print(f"  Volume vs 20-day Avg: {mkt['volume_ratio']:.2f}x ({volume_status})")
                     if mkt.get('potential_liquidity_zone'):
-                        print(f"  ⚠️ AT LIQUIDITY ZONE - High probability of price reaction")
+                        print(f"  WARNING: AT LIQUIDITY ZONE - High probability of price reaction")
 
                 # Wyckoff pattern section
                 if mkt.get('wyckoff_pattern') and mkt['wyckoff_pattern'] != "none":
                     print()
-                    print("📊 Wyckoff Pattern:")
+                    print("Wyckoff Pattern:")
                     details = mkt.get('wyckoff_details', {})
                     if mkt['wyckoff_pattern'] == "distribution":
                         print(f"  Pattern: DISTRIBUTION (BEARISH)")
@@ -1951,7 +2105,7 @@ class BitcoinTradingBot:
         print(f"Reasoning: {rec['reasoning']}")
         print()
 
-        print("=� POSITION SIZING")
+        print("POSITION SIZING")
         print("-" * 80)
         pos = results["position_sizing"]
         print(f"Position Value: ${pos['position_value_usd']:,.2f} ({pos['percentage_of_portfolio']:.1f}% of portfolio)")
@@ -2056,7 +2210,7 @@ def main():
             max_articles=10
         )
 
-        print("\n✅ Analysis complete!")
+        print("\nAnalysis complete!")
         print(f"Results saved in evaluation format for framework compatibility")
 
     except KeyboardInterrupt:
