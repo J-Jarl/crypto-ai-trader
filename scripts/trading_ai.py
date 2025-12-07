@@ -370,13 +370,14 @@ class MarketDataFetcher:
 
         return round(ema, 2)
 
-    def calculate_atr(self, ohlcv_data: List[List], period: int = 14) -> Optional[float]:
+    def calculate_atr(self, ohlcv_data: List[List], period: int = 14, timeframe: str = "1d") -> Optional[float]:
         """
         Calculate Average True Range (ATR) for volatility measurement.
 
         Args:
             ohlcv_data: OHLCV candle data [timestamp, open, high, low, close, volume]
             period: ATR period (default 14)
+            timeframe: Candle timeframe for reference (default "1d")
 
         Returns:
             ATR value or None if insufficient data
@@ -415,7 +416,8 @@ class MarketDataFetcher:
         entry_price: float,
         target_price: Optional[float],
         action: str,  # "buy" or "sell"
-        portfolio_value: float
+        portfolio_value: float,
+        timeframe: str = "1h"  # Timeframe for ATR calculation
     ) -> Dict:
         """
         Calculate hybrid stop-loss with ATR, R/R validation, and leverage optimization.
@@ -426,12 +428,13 @@ class MarketDataFetcher:
             target_price: Take profit target (optional)
             action: Trade direction ("buy" or "sell")
             portfolio_value: Total portfolio value in USD
+            timeframe: Timeframe for ATR calculation (default "1h" for 12h evaluation window)
 
         Returns:
             Dictionary with comprehensive stop-loss and leverage analysis
         """
-        # Calculate ATR
-        atr = self.calculate_atr(ohlcv_data, period=14)
+        # Calculate ATR with specified timeframe
+        atr = self.calculate_atr(ohlcv_data, period=14, timeframe=timeframe)
 
         if not atr or not entry_price or entry_price <= 0:
             return {
@@ -492,6 +495,7 @@ class MarketDataFetcher:
 
         return {
             "atr_value": round(atr, 2),
+            "atr_timeframe": timeframe,
             "atr_stop_loss": round(atr_stop_loss, 2),
             "risk_reward_ratio": risk_reward_ratio,
             "meets_rr_minimum": meets_rr_minimum,
@@ -1792,19 +1796,22 @@ class BitcoinTradingBot:
         print("Calculating hybrid stop-loss and leverage optimization...")
         hybrid_stop = None
         if recommendation.action.lower() in ["buy", "sell"] and market_data.exchange_available:
-            # Fetch OHLCV data for ATR calculation
-            ohlcv = self.market_data_fetcher.get_btc_ohlcv(timeframe='1d', limit=100)
-            if ohlcv:
+            # Fetch HOURLY OHLCV data for ATR calculation (aligned with 12h evaluation window)
+            # Using 1h candles gives tighter stops appropriate for short-term trading
+            ohlcv_hourly = self.market_data_fetcher.get_btc_ohlcv(timeframe='1h', limit=100)
+            if ohlcv_hourly:
                 hybrid_stop = self.market_data_fetcher.calculate_hybrid_stop_loss(
-                    ohlcv_data=ohlcv,
+                    ohlcv_data=ohlcv_hourly,
                     entry_price=recommendation.entry_price or current_price,
                     target_price=recommendation.take_profit,
                     action=recommendation.action,
-                    portfolio_value=portfolio_value
+                    portfolio_value=portfolio_value,
+                    timeframe='1h'
                 )
                 if hybrid_stop and hybrid_stop.get("atr_value"):
                     print(f"  Hybrid Stop-Loss Calculated")
-                    print(f"  - ATR(14): ${hybrid_stop['atr_value']:,.2f}")
+                    timeframe_label = hybrid_stop.get('atr_timeframe', '1h')
+                    print(f"  - ATR(14, {timeframe_label}): ${hybrid_stop['atr_value']:,.2f}")
                     print(f"  - ATR Stop Loss: ${hybrid_stop['atr_stop_loss']:,.2f}")
                     if hybrid_stop.get('risk_reward_ratio'):
                         rr_status = "GOOD" if hybrid_stop['meets_rr_minimum'] else "LOW"
@@ -2125,7 +2132,8 @@ class BitcoinTradingBot:
             if hybrid.get("atr_value"):
                 print("HYBRID STOP-LOSS & LEVERAGE ANALYSIS")
                 print("-" * 80)
-                print(f"ATR(14): ${hybrid['atr_value']:,.2f}")
+                timeframe_label = hybrid.get('atr_timeframe', '1h')
+                print(f"ATR(14, {timeframe_label}): ${hybrid['atr_value']:,.2f}")
                 print(f"ATR-Based Stop Loss: ${hybrid['atr_stop_loss']:,.2f}")
 
                 if hybrid.get('risk_reward_ratio'):
