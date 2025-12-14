@@ -1,0 +1,49 @@
+DEMONSTRATION: How Validation Fixes AI Hallucinations
+
+=== BEFORE VALIDATION ===
+
+AI Generated Recommendation:
+- Action: SELL
+- Entry: null
+- Stop-Loss: $88,000 (WRONG - should be above entry for SELL)
+- Take-Profit: $40,000 (-55% crash in 12h - UNREALISTIC)
+
+Problems:
+1. Entry is null - cannot execute trade
+2. Stop-loss is below entry (wrong direction for SELL)
+3. Target implies -55% crash in 12 hours (impossible)
+
+=== AFTER VALIDATION ===
+
+Market Data:
+- Current Price: $90,000
+- ATR (1h): $2,000
+
+Validation Applied:
+- Fixed entry_price: null → $90,000 (current price)
+- Fixed stop_loss: $88,000 → $95,000 (entry + 2.5×ATR = protection)
+- Fixed take_profit: $40,000 → $82,000 (entry - 4×ATR = realistic)
+
+Final Recommendation:
+- Action: SELL
+- Entry: $90,000
+- Stop-Loss: $95,000 (5.5% above entry - protects against upside)
+- Take-Profit: $82,000 (8.9% below entry - realistic 12h target)
+
+Validation Info Saved:
+{
+  "validation_applied": true,
+  "fixes_applied": [
+    "entry_price_set_to_current",
+    "sell_stop_fixed_direction", 
+    "target_overridden_atr_based"
+  ],
+  "ai_original_target": 40000.0,
+  "target_overridden": true
+}
+
+=== RESULT ===
+
+✓ All values are now realistic and safe to trade
+✓ Original AI values preserved for debugging
+✓ Clear audit trail of what was fixed
