@@ -1568,6 +1568,113 @@ Provide your recommendation in JSON format as specified."""
                     return json.loads(response[start:end])
                 raise ValueError("No valid JSON found in response")
 
+    def validate_and_fix_recommendation(
+        self,
+        recommendation: TradingRecommendation,
+        market_data: MarketData,
+        atr_hourly: Optional[float] = None
+    ) -> tuple[TradingRecommendation, Dict]:
+        """
+        Validate and fix AI-generated recommendation to ensure realistic targets.
+
+        Args:
+            recommendation: The AI-generated recommendation
+            market_data: Current market data
+            atr_hourly: ATR calculated from hourly data (if available)
+
+        Returns:
+            Tuple of (fixed_recommendation, validation_info)
+        """
+        validation_info = {
+            "validation_applied": False,
+            "fixes_applied": [],
+            "ai_original_target": None,
+            "target_overridden": False
+        }
+
+        # Skip validation for HOLD actions
+        if recommendation.action.lower() == "hold":
+            return recommendation, validation_info
+
+        validation_info["validation_applied"] = True
+        current_price = market_data.current_price
+
+        # 1. Fix Missing Entry Price
+        if recommendation.entry_price is None or recommendation.entry_price <= 0:
+            recommendation.entry_price = current_price
+            validation_info["fixes_applied"].append("entry_price_set_to_current")
+
+        entry_price = recommendation.entry_price
+
+        # 2. Calculate ATR-Based Target Constraints
+        atr_based_target = None
+        if atr_hourly and atr_hourly > 0:
+            if recommendation.action.lower() == "sell":
+                atr_based_target = entry_price - (4 * atr_hourly)
+            else:  # buy
+                atr_based_target = entry_price + (4 * atr_hourly)
+
+        # 3. Validate and Fix Take-Profit Target
+        if recommendation.take_profit and recommendation.take_profit > 0:
+            # Calculate percentage change from entry to target
+            pct_change = abs((recommendation.take_profit - entry_price) / entry_price) * 100
+
+            # Check if target is unrealistic (>15% from entry in 12h window)
+            if pct_change > 15.0:
+                validation_info["ai_original_target"] = recommendation.take_profit
+
+                if atr_based_target:
+                    recommendation.take_profit = round(atr_based_target, 2)
+                    validation_info["fixes_applied"].append("target_overridden_atr_based")
+                    validation_info["target_overridden"] = True
+                else:
+                    # Fallback: cap at 15% if no ATR available
+                    if recommendation.action.lower() == "sell":
+                        recommendation.take_profit = round(entry_price * 0.85, 2)
+                    else:  # buy
+                        recommendation.take_profit = round(entry_price * 1.15, 2)
+                    validation_info["fixes_applied"].append("target_capped_at_15_percent")
+                    validation_info["target_overridden"] = True
+
+            # Validate target is in correct direction
+            if recommendation.action.lower() == "buy" and recommendation.take_profit <= entry_price:
+                if atr_based_target:
+                    recommendation.take_profit = round(atr_based_target, 2)
+                else:
+                    recommendation.take_profit = round(entry_price * 1.05, 2)
+                validation_info["fixes_applied"].append("buy_target_fixed_direction")
+
+            elif recommendation.action.lower() == "sell" and recommendation.take_profit >= entry_price:
+                if atr_based_target:
+                    recommendation.take_profit = round(atr_based_target, 2)
+                else:
+                    recommendation.take_profit = round(entry_price * 0.95, 2)
+                validation_info["fixes_applied"].append("sell_target_fixed_direction")
+
+        # 4. Validate and Fix Stop-Loss Direction
+        if recommendation.stop_loss and recommendation.stop_loss > 0:
+            stop_fixed = False
+
+            # For SELL: stop must be > entry (protect against upside)
+            if recommendation.action.lower() == "sell" and recommendation.stop_loss <= entry_price:
+                if atr_hourly:
+                    recommendation.stop_loss = round(entry_price + (2.5 * atr_hourly), 2)
+                else:
+                    recommendation.stop_loss = round(entry_price * 1.03, 2)
+                validation_info["fixes_applied"].append("sell_stop_fixed_direction")
+                stop_fixed = True
+
+            # For BUY: stop must be < entry (protect against downside)
+            elif recommendation.action.lower() == "buy" and recommendation.stop_loss >= entry_price:
+                if atr_hourly:
+                    recommendation.stop_loss = round(entry_price - (2.5 * atr_hourly), 2)
+                else:
+                    recommendation.stop_loss = round(entry_price * 0.97, 2)
+                validation_info["fixes_applied"].append("buy_stop_fixed_direction")
+                stop_fixed = True
+
+        return recommendation, validation_info
+
     def calculate_position_size(
         self,
         recommendation: TradingRecommendation,
@@ -1756,6 +1863,34 @@ class BitcoinTradingBot:
         print(f"  - Confidence: {recommendation.confidence:.1f}%")
         print()
 
+        # Fetch ATR hourly data early for validation (before any other processing)
+        atr_hourly_value = None
+        ohlcv_hourly = None
+        if recommendation.action.lower() in ["buy", "sell"] and market_data.exchange_available:
+            ohlcv_hourly = self.market_data_fetcher.get_btc_ohlcv(timeframe='1h', limit=100)
+            if ohlcv_hourly:
+                atr_hourly_value = self.market_data_fetcher.calculate_atr(
+                    ohlcv_hourly, period=14, timeframe='1h'
+                )
+
+        # VALIDATE AND FIX RECOMMENDATION (before saving or further processing)
+        print("Validating and fixing AI recommendation...")
+        recommendation, validation_info = self.trading_advisor.validate_and_fix_recommendation(
+            recommendation, market_data, atr_hourly_value
+        )
+
+        if validation_info.get("validation_applied"):
+            if validation_info.get("fixes_applied"):
+                print(f"  Validation fixes applied: {len(validation_info['fixes_applied'])}")
+                for fix in validation_info["fixes_applied"]:
+                    print(f"    - {fix}")
+                if validation_info.get("target_overridden"):
+                    print(f"    - AI original target: ${validation_info['ai_original_target']:,.2f}")
+                    print(f"    - New validated target: ${recommendation.take_profit:,.2f}")
+            else:
+                print(f"  Validation passed - no fixes needed")
+        print()
+
         # SAFETY CHECK: Force HOLD if all exchanges failed
         blocked_recommendation = None
         if not market_data.exchange_available:
@@ -1796,9 +1931,10 @@ class BitcoinTradingBot:
         print("Calculating hybrid stop-loss and leverage optimization...")
         hybrid_stop = None
         if recommendation.action.lower() in ["buy", "sell"] and market_data.exchange_available:
-            # Fetch HOURLY OHLCV data for ATR calculation (aligned with 12h evaluation window)
-            # Using 1h candles gives tighter stops appropriate for short-term trading
-            ohlcv_hourly = self.market_data_fetcher.get_btc_ohlcv(timeframe='1h', limit=100)
+            # Reuse OHLCV data fetched earlier for validation (already fetched at line ~1868)
+            # If not available, fetch it now
+            if not ohlcv_hourly:
+                ohlcv_hourly = self.market_data_fetcher.get_btc_ohlcv(timeframe='1h', limit=100)
             if ohlcv_hourly:
                 hybrid_stop = self.market_data_fetcher.calculate_hybrid_stop_loss(
                     ohlcv_data=ohlcv_hourly,
@@ -1959,7 +2095,8 @@ class BitcoinTradingBot:
             },
             "position_sizing": position_details,
             "hybrid_stop_loss": hybrid_stop if hybrid_stop else None,
-            "blocked_recommendation": blocked_recommendation if blocked_recommendation else None
+            "blocked_recommendation": blocked_recommendation if blocked_recommendation else None,
+            "validation_info": validation_info if validation_info else None
         }
 
         # Display results
