@@ -1330,11 +1330,12 @@ Your response must be valid JSON with this structure:
 }
 
 SIGNAL PRIORITY for 12h trading (evaluate signals in this order):
-1. HIGH PRIORITY: Short-term MAs (SMA5/10, EMA9), short-term Wyckoff patterns (if present), volume spikes, reversal signals
-2. MEDIUM PRIORITY: RSI, liquidity zones, medium-term Wyckoff patterns
-3. LOW PRIORITY: Long-term Wyckoff patterns (ONLY if within 10% of current price), Fear & Greed Index (use contrarian), SMA50
+1. HIGHEST PRIORITY: BOUNCE PATTERNS - If detected, this OVERRIDES all conflicting signals. These combine Wyckoff + price position + volume for high-probability setups.
+2. HIGH PRIORITY: Short-term MAs (SMA5/10, EMA9), short-term Wyckoff patterns (if present), volume spikes, reversal signals
+3. MEDIUM PRIORITY: RSI, liquidity zones, medium-term Wyckoff patterns
+4. LOW PRIORITY: Long-term Wyckoff patterns (ONLY if within 10% of current price), Fear & Greed Index (use contrarian), SMA50
 
-Consider the news sentiment, technical indicators (RSI, moving averages, Fear & Greed Index), liquidity zones (support/resistance levels), volume analysis, Wyckoff patterns, and any reversal signals in your analysis.
+Consider the news sentiment, technical indicators (RSI, moving averages, Fear & Greed Index), liquidity zones (support/resistance levels), volume analysis, Wyckoff patterns, bounce patterns, and any reversal signals in your analysis.
 Weight short-term signals more heavily for 12h predictions. Long-term patterns far from current price should be de-emphasized.
 Reversal signals and liquidity zones are important as they often precede significant price movements.
 Wyckoff patterns indicate smart money activity: Distribution (bearish - selling into strength), Accumulation (bullish - buying into weakness), and Failed Breakouts (traps/liquidity grabs).
@@ -1479,6 +1480,130 @@ class BitcoinTradingAdvisor:
 
         return {"type": "none"}
 
+    def detect_bounce_patterns(self, market_data: Optional[MarketData] = None) -> Dict:
+        """
+        Detect classic bounce setups combining Wyckoff patterns with price position vs MAs.
+
+        PATTERN 1 - OVERSOLD BOUNCE (Bullish):
+        - Wyckoff shows Accumulation or Spring phase (any timeframe)
+        - Price below SMA(20) OR SMA(50) (oversold)
+        - Volume > 1.5x average (capitulation/accumulation confirmation)
+        Signal: Strong BUY - Smart money buying oversold dip
+
+        PATTERN 2 - OVERBOUGHT REJECTION (Bearish):
+        - Wyckoff shows Distribution or Upthrust phase (any timeframe)
+        - Price above SMA(20) OR SMA(50) (overbought)
+        - Volume > 1.5x average (distribution/exhaustion confirmation)
+        Signal: Strong SELL - Smart money selling overbought rally
+
+        Returns:
+            Dict with keys:
+                - pattern: "oversold_bounce", "overbought_rejection", or "none"
+                - strength: "strong" or "moderate"
+                - signal: "BUY", "SELL", or None
+                - reasoning: explanation string
+                - wyckoff_timeframe: which timeframe triggered (if applicable)
+        """
+        if not market_data:
+            return {"pattern": "none", "strength": None, "signal": None, "reasoning": "No market data available"}
+
+        # Check if we have required data
+        if not market_data.wyckoff_patterns or not market_data.current_price:
+            return {"pattern": "none", "strength": None, "signal": None, "reasoning": "Insufficient data for pattern detection"}
+
+        # Check for Wyckoff accumulation or distribution across all timeframes
+        wyckoff_accumulation = False
+        wyckoff_distribution = False
+        wyckoff_timeframe = None
+
+        # Priority: short-term > medium-term > long-term
+        for timeframe in ["short_term", "medium_term", "long_term"]:
+            pattern = market_data.wyckoff_patterns.get(timeframe)
+            if pattern:
+                if pattern.get("pattern") == "accumulation":
+                    wyckoff_accumulation = True
+                    wyckoff_timeframe = timeframe
+                    break
+                elif pattern.get("pattern") == "distribution":
+                    wyckoff_distribution = True
+                    wyckoff_timeframe = timeframe
+                    break
+                elif pattern.get("pattern") == "failed_breakout":
+                    # Bear trap = bullish (accumulation-like)
+                    # Bull trap = bearish (distribution-like)
+                    trap_type = pattern.get("type")
+                    if trap_type == "bear_trap":
+                        wyckoff_accumulation = True
+                        wyckoff_timeframe = timeframe
+                        break
+                    elif trap_type == "bull_trap":
+                        wyckoff_distribution = True
+                        wyckoff_timeframe = timeframe
+                        break
+
+        # Check price position vs moving averages
+        price_oversold = False
+        price_overbought = False
+        ma_reference = None
+
+        if market_data.price_vs_sma20 == "below":
+            price_oversold = True
+            ma_reference = "SMA(20)"
+        elif market_data.price_vs_sma50 == "below":
+            price_oversold = True
+            ma_reference = "SMA(50)"
+        elif market_data.price_vs_sma20 == "above":
+            price_overbought = True
+            ma_reference = "SMA(20)"
+        elif market_data.price_vs_sma50 == "above":
+            price_overbought = True
+            ma_reference = "SMA(50)"
+
+        # Check volume confirmation (volume spike = high volume)
+        volume_confirmation = market_data.volume_spike if market_data.volume_spike is not None else False
+        volume_ratio = market_data.volume_ratio if market_data.volume_ratio else 1.0
+
+        # PATTERN 1: OVERSOLD BOUNCE (Bullish)
+        if wyckoff_accumulation and price_oversold:
+            strength = "strong" if volume_confirmation else "moderate"
+            reasoning = f"OVERSOLD BOUNCE detected on {wyckoff_timeframe}: "
+            reasoning += f"Wyckoff accumulation pattern + price below {ma_reference} (oversold)"
+            if volume_confirmation:
+                reasoning += f" + high volume ({volume_ratio:.1f}x avg) confirms capitulation/accumulation. "
+                reasoning += "Smart money buying the dip - bounce highly probable."
+            else:
+                reasoning += ". Moderate setup - volume confirmation would strengthen signal."
+
+            return {
+                "pattern": "oversold_bounce",
+                "strength": strength,
+                "signal": "BUY",
+                "reasoning": reasoning,
+                "wyckoff_timeframe": wyckoff_timeframe
+            }
+
+        # PATTERN 2: OVERBOUGHT REJECTION (Bearish)
+        if wyckoff_distribution and price_overbought:
+            strength = "strong" if volume_confirmation else "moderate"
+            reasoning = f"OVERBOUGHT REJECTION detected on {wyckoff_timeframe}: "
+            reasoning += f"Wyckoff distribution pattern + price above {ma_reference} (overbought)"
+            if volume_confirmation:
+                reasoning += f" + high volume ({volume_ratio:.1f}x avg) confirms distribution/exhaustion. "
+                reasoning += "Smart money selling the rally - rejection highly probable."
+            else:
+                reasoning += ". Moderate setup - volume confirmation would strengthen signal."
+
+            return {
+                "pattern": "overbought_rejection",
+                "strength": strength,
+                "signal": "SELL",
+                "reasoning": reasoning,
+                "wyckoff_timeframe": wyckoff_timeframe
+            }
+
+        # No pattern detected
+        return {"pattern": "none", "strength": None, "signal": None, "reasoning": "No bounce pattern detected"}
+
     def _format_wyckoff_pattern(self, pattern: Dict) -> str:
         """Format a Wyckoff pattern for display in market context"""
         if not pattern:
@@ -1547,6 +1672,9 @@ class BitcoinTradingAdvisor:
         # Detect reversal conditions first
         reversal = self.detect_reversal_conditions(market_data)
 
+        # Detect bounce patterns (highest priority)
+        bounce_pattern = self.detect_bounce_patterns(market_data)
+
         system_prompt = """You are an expert Bitcoin trading advisor. Generate trading recommendations in JSON format.
 Your response must be valid JSON with this structure:
 {
@@ -1560,11 +1688,12 @@ Your response must be valid JSON with this structure:
 }
 
 SIGNAL PRIORITY for 12h trading (evaluate signals in this order):
-1. HIGH PRIORITY: Short-term MAs (SMA5/10, EMA9), short-term Wyckoff patterns (if present), volume spikes, reversal signals
-2. MEDIUM PRIORITY: RSI, liquidity zones, medium-term Wyckoff patterns
-3. LOW PRIORITY: Long-term Wyckoff patterns (ONLY if within 10% of current price), Fear & Greed Index (use contrarian), SMA50
+1. HIGHEST PRIORITY: BOUNCE PATTERNS - If detected, this OVERRIDES all conflicting signals. These combine Wyckoff + price position + volume for high-probability setups.
+2. HIGH PRIORITY: Short-term MAs (SMA5/10, EMA9), short-term Wyckoff patterns (if present), volume spikes, reversal signals
+3. MEDIUM PRIORITY: RSI, liquidity zones, medium-term Wyckoff patterns
+4. LOW PRIORITY: Long-term Wyckoff patterns (ONLY if within 10% of current price), Fear & Greed Index (use contrarian), SMA50
 
-Use technical indicators (RSI, moving averages), market sentiment (Fear & Greed), liquidity zones (support/resistance), volume analysis, Wyckoff patterns, and reversal signals to inform your decision.
+Use technical indicators (RSI, moving averages), market sentiment (Fear & Greed), liquidity zones (support/resistance), volume analysis, Wyckoff patterns, bounce patterns, and reversal signals to inform your decision.
 Weight short-term signals more heavily for 12h predictions. Long-term patterns far from current price (>10% away) should be de-emphasized or ignored.
 Pay special attention to reversal conditions, short-term Wyckoff patterns, and liquidity zones as they often precede significant price movements.
 Wyckoff patterns reveal smart money activity: Distribution (bearish), Accumulation (bullish), Failed Breakouts (traps).
@@ -1613,6 +1742,15 @@ Consider volume spikes as potential capitulation or exhaustion signals."""
                     market_context += f"- Volume vs 20-day Avg: {market_data.volume_ratio}x ({volume_status})\n"
                 if market_data.potential_liquidity_zone:
                     market_context += "- ⚠️ AT LIQUIDITY ZONE - Price likely to react here (bounce or break)\n"
+
+            # Bounce pattern analysis (HIGHEST PRIORITY)
+            if bounce_pattern["pattern"] != "none":
+                market_context += "\n🚨 BOUNCE PATTERN DETECTED (HIGHEST PRIORITY - OVERRIDES CONFLICTING SIGNALS):\n"
+                market_context += f"- Pattern: {bounce_pattern['pattern'].upper().replace('_', ' ')}\n"
+                market_context += f"- Signal: {bounce_pattern['signal']} ({bounce_pattern['strength'].upper()})\n"
+                market_context += f"- Timeframe: {bounce_pattern['wyckoff_timeframe'].upper().replace('_', ' ')}\n"
+                market_context += f"- Reasoning: {bounce_pattern['reasoning']}\n"
+                market_context += "- ⚠️ This is a high-probability setup - strongly consider this signal!\n"
 
             # Wyckoff pattern analysis (multi-timeframe)
             if market_data.wyckoff_patterns:
@@ -1687,6 +1825,7 @@ Consider the risk tolerance when determining position size:
 - Medium risk: 3-7% of portfolio
 - High risk: 7-15% of portfolio
 
+CRITICAL: If a BOUNCE PATTERN is detected, this is the HIGHEST PRIORITY signal and OVERRIDES all conflicting signals. These are high-probability setups combining Wyckoff smart money activity + price position + volume confirmation.
 IMPORTANT: If a reversal signal is detected, consider it carefully in your recommendation as these often precede significant price movements.
 
 Provide your recommendation in JSON format as specified."""
@@ -2000,6 +2139,20 @@ class BitcoinTradingBot:
             print(f" No reversal conditions detected")
         print()
 
+        # Detect bounce patterns (HIGHEST PRIORITY)
+        print("Detecting bounce patterns (Wyckoff + MA + Volume)...")
+        bounce_pattern = self.trading_advisor.detect_bounce_patterns(market_data)
+        if bounce_pattern["pattern"] != "none":
+            print(f" 🚨 BOUNCE PATTERN DETECTED (HIGHEST PRIORITY)!")
+            print(f"  - Pattern: {bounce_pattern['pattern'].upper().replace('_', ' ')}")
+            print(f"  - Signal: {bounce_pattern['signal']} ({bounce_pattern['strength'].upper()})")
+            print(f"  - Timeframe: {bounce_pattern['wyckoff_timeframe'].upper().replace('_', ' ')}")
+            print(f"  - Reasoning: {bounce_pattern['reasoning']}")
+            print(f"  - ⚠️ This signal OVERRIDES conflicting indicators!")
+        else:
+            print(f" No bounce pattern detected")
+        print()
+
         # Fetch news articles
         print(f"Fetching Bitcoin news articles (max {max_articles})...")
         articles = self.news_aggregator.fetch_news(max_articles=max_articles)
@@ -2248,6 +2401,7 @@ class BitcoinTradingBot:
                 "wyckoff_patterns": market_data.wyckoff_patterns
             },
             "reversal_signal": reversal_signal,
+            "bounce_pattern": bounce_pattern,
             "sentiment": {
                 "sentiment": sentiment.sentiment,
                 "confidence": sentiment.confidence,
@@ -2334,6 +2488,22 @@ class BitcoinTradingBot:
                 print("Type: OVERBOUGHT REVERSAL (Potential Top)")
                 print("Description: Extreme greed + overbought RSI often precede corrections")
             print(f"Strength: {reversal['strength'].upper()}")
+            print()
+
+        # Display bounce pattern if present (HIGHEST PRIORITY)
+        if "bounce_pattern" in results and results["bounce_pattern"]["pattern"] != "none":
+            print("🚨 BOUNCE PATTERN DETECTED (HIGHEST PRIORITY)")
+            print("=" * 80)
+            bounce = results["bounce_pattern"]
+            print(f"Pattern: {bounce['pattern'].upper().replace('_', ' ')}")
+            print(f"Signal: {bounce['signal']} ({bounce['strength'].upper()})")
+            print(f"Timeframe: {bounce['wyckoff_timeframe'].upper().replace('_', ' ')}")
+            print(f"Reasoning: {bounce['reasoning']}")
+            print()
+            print("⚠️  THIS SIGNAL OVERRIDES ALL CONFLICTING INDICATORS")
+            print("    Bounce patterns combine Wyckoff smart money activity,")
+            print("    price position vs moving averages, and volume confirmation.")
+            print("    These are high-probability setups that should be strongly weighted.")
             print()
 
         # Display market data first (only if we have valid data)
