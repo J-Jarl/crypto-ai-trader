@@ -17,24 +17,110 @@ Created: November 14, 2025
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import ccxt
 from pathlib import Path
+import argparse
+import re
 
 
 class TradingEvaluator:
     """Evaluates trading AI predictions against actual market outcomes"""
-    
+
     def __init__(self, results_dir: str = "data/analysis_results"):
         """
         Initialize the evaluator
-        
+
         Args:
             results_dir: Path to directory containing AI trading recommendations
         """
         self.results_dir = Path(results_dir)
         self.exchange = ccxt.coinbase()
         self.evaluation_log = []
+
+    @staticmethod
+    def parse_prediction_date(filename: str) -> Optional[datetime]:
+        """
+        Parse prediction date from filename
+
+        Expected format: btc_analysis_YYYYMMDD_HHMMSS.json
+
+        Args:
+            filename: The prediction filename
+
+        Returns:
+            datetime object if parsed successfully, None otherwise
+        """
+        # Match pattern: btc_analysis_YYYYMMDD_HHMMSS.json
+        pattern = r'btc_analysis_(\d{8})_(\d{6})\.json'
+        match = re.match(pattern, filename)
+
+        if match:
+            date_str = match.group(1)  # YYYYMMDD
+            time_str = match.group(2)  # HHMMSS
+            try:
+                return datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+            except ValueError:
+                return None
+        return None
+
+    def filter_files_by_date(self, files: List[Path],
+                            start_date: Optional[datetime] = None,
+                            end_date: Optional[datetime] = None) -> Tuple[List[Path], Dict]:
+        """
+        Filter prediction files by date range
+
+        Args:
+            files: List of file paths to filter
+            start_date: Start date (inclusive), None for no start limit
+            end_date: End date (inclusive), None for no end limit
+
+        Returns:
+            Tuple of (filtered_files, summary_info)
+        """
+        filtered = []
+        all_dates = []
+
+        for filepath in files:
+            pred_date = self.parse_prediction_date(filepath.name)
+
+            if pred_date is None:
+                continue
+
+            all_dates.append(pred_date.date())
+
+            # Apply date filtering
+            if start_date and pred_date.date() < start_date.date():
+                continue
+            if end_date and pred_date.date() > end_date.date():
+                continue
+
+            filtered.append(filepath)
+
+        # Build summary information
+        summary = {
+            'total_files_scanned': len(files),
+            'files_matched': len(filtered),
+            'files_excluded': len(files) - len(filtered),
+            'date_range_requested': None,
+            'missing_days': []
+        }
+
+        if start_date and end_date:
+            summary['date_range_requested'] = f"{start_date.date()} to {end_date.date()}"
+
+            # Check for missing days in range
+            expected_dates = set()
+            current = start_date.date()
+            while current <= end_date.date():
+                expected_dates.add(current)
+                current += timedelta(days=1)
+
+            actual_dates = set(d for d in all_dates if start_date.date() <= d <= end_date.date())
+            missing = sorted(expected_dates - actual_dates)
+            summary['missing_days'] = [d.strftime('%Y-%m-%d') for d in missing]
+
+        return filtered, summary
         
     def load_prediction(self, filepath: Path) -> Dict:
         """Load a single prediction JSON file"""
@@ -301,20 +387,31 @@ class TradingEvaluator:
         return round(pnl, 2)
     
     def evaluate_all_predictions(self, hours_forward: int = 12,
-                                 limit: int = None) -> List[Dict]:
+                                 limit: int = None,
+                                 start_date: Optional[datetime] = None,
+                                 end_date: Optional[datetime] = None) -> List[Dict]:
         """
         Evaluate all predictions in the results directory
 
         Args:
             hours_forward: Hours to look forward for outcomes (default 12)
             limit: Maximum number of predictions to evaluate (None = all)
+            start_date: Optional start date filter (inclusive)
+            end_date: Optional end date filter (inclusive)
 
         Returns:
             List of evaluation results
         """
         # Get all prediction JSON files (exclude evaluation reports)
         all_files = sorted(self.results_dir.glob('*.json'), reverse=True)
-        json_files = [f for f in all_files if not f.name.startswith('evaluation_')]
+        all_files = [f for f in all_files if not f.name.startswith('evaluation_')]
+
+        # Apply date filtering if specified
+        if start_date or end_date:
+            json_files, filter_summary = self.filter_files_by_date(all_files, start_date, end_date)
+            self._print_date_filter_summary(filter_summary)
+        else:
+            json_files = all_files
 
         if limit:
             json_files = json_files[:limit]
@@ -339,19 +436,30 @@ class TradingEvaluator:
 
         return evaluations
 
-    def evaluate_all_predictions_multi_timeframe(self, limit: int = None) -> Dict:
+    def evaluate_all_predictions_multi_timeframe(self, limit: int = None,
+                                                 start_date: Optional[datetime] = None,
+                                                 end_date: Optional[datetime] = None) -> Dict:
         """
         Evaluate all predictions at multiple timeframes (4h, 12h, 24h)
 
         Args:
             limit: Maximum number of predictions to evaluate (None = all)
+            start_date: Optional start date filter (inclusive)
+            end_date: Optional end date filter (inclusive)
 
         Returns:
             Dictionary with timeframe-separated evaluation results
         """
         # Get all prediction JSON files (exclude evaluation reports)
         all_files = sorted(self.results_dir.glob('*.json'), reverse=True)
-        json_files = [f for f in all_files if not f.name.startswith('evaluation_')]
+        all_files = [f for f in all_files if not f.name.startswith('evaluation_')]
+
+        # Apply date filtering if specified
+        if start_date or end_date:
+            json_files, filter_summary = self.filter_files_by_date(all_files, start_date, end_date)
+            self._print_date_filter_summary(filter_summary)
+        else:
+            json_files = all_files
 
         if limit:
             json_files = json_files[:limit]
@@ -391,6 +499,31 @@ class TradingEvaluator:
 
         return timeframe_results
     
+    def _print_date_filter_summary(self, summary: Dict):
+        """Print summary of date filtering results"""
+        print(f"\n{'='*60}")
+        print(f"DATE FILTER SUMMARY")
+        print(f"{'='*60}")
+
+        if summary['date_range_requested']:
+            print(f"Date Range: {summary['date_range_requested']}")
+        else:
+            print(f"Date Range: All available dates")
+
+        print(f"Total Files Scanned: {summary['total_files_scanned']}")
+        print(f"Files Matched: {summary['files_matched']}")
+        print(f"Files Excluded: {summary['files_excluded']}")
+
+        if summary['missing_days']:
+            print(f"\nWarning: Missing predictions for {len(summary['missing_days'])} day(s):")
+            for missing_day in summary['missing_days']:
+                print(f"  - {missing_day}")
+        else:
+            if summary['date_range_requested']:
+                print(f"\nAll days in range have predictions")
+
+        print(f"{'='*60}\n")
+
     def _print_evaluation_summary(self, evaluation: Dict):
         """Print a brief summary of single evaluation"""
         correct_icon = "✓" if evaluation['prediction_correct'] else "✗"
@@ -800,13 +933,85 @@ class TradingEvaluator:
         print(f"{'='*60}\n")
 
 
+def parse_arguments():
+    """Parse command-line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Evaluate Bitcoin Trading AI predictions against historical data',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Evaluate all predictions
+  python scripts/evaluation_framework.py
+
+  # Evaluate Week 3 (Mon-Sat)
+  python scripts/evaluation_framework.py --start-date 2025-12-16 --end-date 2025-12-20
+
+  # Multi-timeframe evaluation for a specific week
+  python scripts/evaluation_framework.py --multi-timeframe --start-date 2025-12-16 --end-date 2025-12-20
+        """
+    )
+
+    parser.add_argument(
+        '--start-date',
+        type=str,
+        help='Start date for filtering predictions (format: YYYY-MM-DD, inclusive)'
+    )
+
+    parser.add_argument(
+        '--end-date',
+        type=str,
+        help='End date for filtering predictions (format: YYYY-MM-DD, inclusive)'
+    )
+
+    parser.add_argument(
+        '--multi-timeframe', '-m',
+        action='store_true',
+        help='Evaluate at multiple timeframes (4h, 12h, 24h)'
+    )
+
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Maximum number of predictions to evaluate (default: all)'
+    )
+
+    return parser.parse_args()
+
+
 def main():
     """Main execution function"""
-    import sys
+    # Parse command-line arguments
+    args = parse_arguments()
 
     print("\n" + "="*60)
     print("BITCOIN TRADING AI - EVALUATION FRAMEWORK")
     print("="*60 + "\n")
+
+    # Parse date arguments if provided
+    start_date = None
+    end_date = None
+
+    if args.start_date:
+        try:
+            start_date = datetime.strptime(args.start_date, '%Y-%m-%d')
+        except ValueError:
+            print(f"❌ Invalid start date format: {args.start_date}")
+            print("   Expected format: YYYY-MM-DD (e.g., 2025-12-16)")
+            return
+
+    if args.end_date:
+        try:
+            end_date = datetime.strptime(args.end_date, '%Y-%m-%d')
+        except ValueError:
+            print(f"❌ Invalid end date format: {args.end_date}")
+            print("   Expected format: YYYY-MM-DD (e.g., 2025-12-20)")
+            return
+
+    # Validate date range
+    if start_date and end_date and start_date > end_date:
+        print(f"❌ Start date ({args.start_date}) cannot be after end date ({args.end_date})")
+        return
 
     # Initialize evaluator
     evaluator = TradingEvaluator()
@@ -817,17 +1022,21 @@ def main():
         print("   Please ensure trading_ai.py has generated some predictions first.")
         return
 
-    # Check for multi-timeframe mode
-    multi_timeframe = '--multi-timeframe' in sys.argv or '-m' in sys.argv
-
     print("Starting evaluation process...")
     print(f"Results directory: {evaluator.results_dir}")
-    print(f"Mode: {'Multi-timeframe (4h, 12h, 24h)' if multi_timeframe else 'Single timeframe (12h)'}")
+    print(f"Mode: {'Multi-timeframe (4h, 12h, 24h)' if args.multi_timeframe else 'Single timeframe (12h)'}")
+    if start_date or end_date:
+        date_range_str = f"{start_date.date() if start_date else 'earliest'} to {end_date.date() if end_date else 'latest'}"
+        print(f"Date Filter: {date_range_str}")
     print()
 
-    if multi_timeframe:
+    if args.multi_timeframe:
         # Multi-timeframe evaluation
-        timeframe_results = evaluator.evaluate_all_predictions_multi_timeframe(limit=10)
+        timeframe_results = evaluator.evaluate_all_predictions_multi_timeframe(
+            limit=args.limit,
+            start_date=start_date,
+            end_date=end_date
+        )
 
         # Check if we got any results
         has_data = any(len(results) > 0 for results in timeframe_results.values())
@@ -836,6 +1045,8 @@ def main():
             print("❌ No predictions could be evaluated for any timeframe.")
             print("   This could be because:")
             print("   - No prediction files exist")
+            if start_date or end_date:
+                print("   - No predictions match the specified date range")
             print("   - Predictions are too recent (need at least 4h of price history)")
             print("   - Exchange API is unavailable")
             return
@@ -852,6 +1063,10 @@ def main():
         output_data = {
             'generated_at': datetime.now().isoformat(),
             'mode': 'multi_timeframe',
+            'date_filter': {
+                'start_date': start_date.isoformat() if start_date else None,
+                'end_date': end_date.isoformat() if end_date else None
+            },
             'timeframe_report': multi_report,
             'timeframe_results': {tf: results for tf, results in timeframe_results.items()}
         }
@@ -868,12 +1083,18 @@ def main():
 
     else:
         # Standard 12-hour evaluation
-        evaluations = evaluator.evaluate_all_predictions(limit=10)
+        evaluations = evaluator.evaluate_all_predictions(
+            limit=args.limit,
+            start_date=start_date,
+            end_date=end_date
+        )
 
         if not evaluations:
             print("❌ No predictions could be evaluated.")
             print("   This could be because:")
             print("   - No prediction files exist")
+            if start_date or end_date:
+                print("   - No predictions match the specified date range")
             print("   - Predictions are too recent (need 12h of price history)")
             print("   - Exchange API is unavailable")
             return
@@ -884,8 +1105,15 @@ def main():
         # Display report
         evaluator.print_performance_report(report)
 
-        # Save results
-        evaluator.save_evaluation_results(evaluations, report)
+        # Save results (with date filter info in filename if applicable)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        if start_date or end_date:
+            date_suffix = f"_{start_date.strftime('%Y%m%d') if start_date else 'start'}_to_{end_date.strftime('%Y%m%d') if end_date else 'end'}"
+            filename = f"evaluation_report_{timestamp}{date_suffix}.json"
+        else:
+            filename = None  # Use default
+
+        evaluator.save_evaluation_results(evaluations, report, filename)
 
     print("✅ Evaluation complete!")
     print()
