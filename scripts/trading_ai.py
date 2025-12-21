@@ -70,9 +70,8 @@ class MarketData:
     volume_ratio: Optional[float] = None
     volume_spike: bool = False
     potential_liquidity_zone: bool = False
-    # Wyckoff pattern detection
-    wyckoff_pattern: Optional[str] = None
-    wyckoff_details: Optional[Dict] = None
+    # Wyckoff pattern detection (multi-timeframe)
+    wyckoff_patterns: Optional[Dict] = None  # {"short_term": {...}, "medium_term": {...}, "long_term": {...}}
     # Diagnostic info
     exchange_available: bool = False
     exchange_name: str = "None"
@@ -567,16 +566,65 @@ class MarketDataFetcher:
 
     def detect_wyckoff_patterns(self, ohlcv_data: List[List]) -> Dict:
         """
-        Detect Wyckoff accumulation/distribution patterns and failed breakouts.
+        Detect Wyckoff accumulation/distribution patterns and failed breakouts across multiple timeframes.
 
         Args:
             ohlcv_data: OHLCV candle data [timestamp, open, high, low, close, volume]
 
         Returns:
-            Dictionary with pattern type and details
+            Dictionary with nested timeframe structure:
+            {
+                "short_term": {...pattern details...} or None,
+                "medium_term": {...pattern details...} or None,
+                "long_term": {...pattern details...} or None
+            }
         """
         if not ohlcv_data or len(ohlcv_data) < 20:
-            return {"pattern": "none"}
+            return {
+                "short_term": None,
+                "medium_term": None,
+                "long_term": None
+            }
+
+        # Multi-timeframe analysis for 12h trading
+        # Short-term: Last 20 candles (most relevant for 12h predictions)
+        # Medium-term: Last 50 candles
+        # Long-term: Last 100 candles (full dataset)
+
+        result = {}
+
+        # Short-term analysis (last 20 candles - highest priority for 12h)
+        if len(ohlcv_data) >= 20:
+            short_data = ohlcv_data[-20:]
+            result["short_term"] = self._detect_wyckoff_single_timeframe(short_data)
+        else:
+            result["short_term"] = None
+
+        # Medium-term analysis (last 50 candles)
+        if len(ohlcv_data) >= 50:
+            medium_data = ohlcv_data[-50:]
+            result["medium_term"] = self._detect_wyckoff_single_timeframe(medium_data)
+        else:
+            result["medium_term"] = None
+
+        # Long-term analysis (full dataset, up to 100 candles)
+        long_data = ohlcv_data[-100:] if len(ohlcv_data) > 100 else ohlcv_data
+        result["long_term"] = self._detect_wyckoff_single_timeframe(long_data)
+
+        return result
+
+    def _detect_wyckoff_single_timeframe(self, ohlcv_data: List[List]) -> Optional[Dict]:
+        """
+        Detect Wyckoff pattern for a single timeframe.
+
+        Args:
+            ohlcv_data: OHLCV candle data for specific timeframe
+
+        Returns:
+            Dictionary with pattern type and details, or None if no pattern
+        """
+        if not ohlcv_data or len(ohlcv_data) < 10:
+            return None
 
         # Extract highs, lows, closes, and volumes
         highs = [candle[2] for candle in ohlcv_data]
@@ -612,7 +660,7 @@ class MarketDataFetcher:
         if failed_breakout:
             return failed_breakout
 
-        return {"pattern": "none"}
+        return None
 
     def _detect_distribution(self, swing_highs: List[Dict]) -> Optional[Dict]:
         """Detect distribution pattern - multiple tests of same resistance level"""
@@ -946,8 +994,7 @@ class MarketDataFetcher:
                 volume_ratio=liquidity_analysis["volume_ratio"],
                 volume_spike=liquidity_analysis["volume_spike"],
                 potential_liquidity_zone=liquidity_analysis["potential_liquidity_zone"],
-                wyckoff_pattern=wyckoff_pattern.get("pattern"),
-                wyckoff_details=wyckoff_pattern if wyckoff_pattern.get("pattern") != "none" else None,
+                wyckoff_patterns=wyckoff_pattern,
                 exchange_available=True,
                 exchange_name=exchange_name,  # Use the exchange that actually worked
                 exchange_error=None,
@@ -980,6 +1027,7 @@ class MarketDataFetcher:
             ema_9=None,
             price_vs_sma20=None,
             price_vs_sma50=None,
+            wyckoff_patterns=None,
             exchange_available=False,
             exchange_name=self.exchange_name,
             exchange_error=exchange_error,
@@ -1219,33 +1267,44 @@ Current Market Data:
                 if market_data.potential_liquidity_zone:
                     market_context += "- ⚠️ AT POTENTIAL LIQUIDITY ZONE - High probability of price reaction\n"
 
-            # Wyckoff pattern analysis
-            if market_data.wyckoff_pattern and market_data.wyckoff_pattern != "none":
-                market_context += "\n📊 WYCKOFF PATTERN DETECTED:\n"
-                if market_data.wyckoff_pattern == "distribution":
-                    details = market_data.wyckoff_details
-                    market_context += f"- Pattern: DISTRIBUTION (Bearish)\n"
-                    market_context += f"- Resistance Level: ${details['resistance_level']:,.2f} tested {details['test_count']} times\n"
-                    if details['volume_declining']:
-                        market_context += "- Volume declining on tests (classic distribution signature)\n"
-                    market_context += "- Indicates smart money selling into strength - Bearish signal\n"
-                elif market_data.wyckoff_pattern == "accumulation":
-                    details = market_data.wyckoff_details
-                    market_context += f"- Pattern: ACCUMULATION (Bullish)\n"
-                    market_context += f"- Support Level: ${details['support_level']:,.2f} tested {details['test_count']} times\n"
-                    if details['volume_declining']:
-                        market_context += "- Volume declining on tests (classic accumulation signature)\n"
-                    market_context += "- Indicates smart money buying into weakness - Bullish signal\n"
-                elif market_data.wyckoff_pattern == "failed_breakout":
-                    details = market_data.wyckoff_details
-                    if details['type'] == "bull_trap":
-                        market_context += f"- Pattern: BULL TRAP (Bearish)\n"
-                        market_context += f"- Failed breakout above ${details['trap_level']:,.2f}\n"
-                        market_context += "- Liquidity grab above resistance, likely to reverse down\n"
-                    elif details['type'] == "bear_trap":
-                        market_context += f"- Pattern: BEAR TRAP (Bullish)\n"
-                        market_context += f"- Failed breakdown below ${details['trap_level']:,.2f}\n"
-                        market_context += "- Liquidity grab below support, likely to reverse up\n"
+            # Wyckoff pattern analysis (multi-timeframe)
+            if market_data.wyckoff_patterns:
+                wyckoff_found = False
+
+                # Priority 1: Short-term patterns (most relevant for 12h)
+                if market_data.wyckoff_patterns.get("short_term"):
+                    pattern = market_data.wyckoff_patterns["short_term"]
+                    if not wyckoff_found:
+                        market_context += "\n📊 WYCKOFF PATTERNS DETECTED:\n"
+                        wyckoff_found = True
+                    market_context += "🔴 SHORT-TERM (20 candles - HIGHEST PRIORITY for 12h):\n"
+                    market_context += self._format_wyckoff_pattern(pattern)
+
+                # Priority 2: Medium-term patterns
+                if market_data.wyckoff_patterns.get("medium_term"):
+                    pattern = market_data.wyckoff_patterns["medium_term"]
+                    if not wyckoff_found:
+                        market_context += "\n📊 WYCKOFF PATTERNS DETECTED:\n"
+                        wyckoff_found = True
+                    market_context += "🟡 MEDIUM-TERM (50 candles - MEDIUM PRIORITY):\n"
+                    market_context += self._format_wyckoff_pattern(pattern)
+
+                # Priority 3: Long-term patterns (lowest priority, note distance)
+                if market_data.wyckoff_patterns.get("long_term"):
+                    pattern = market_data.wyckoff_patterns["long_term"]
+                    if not wyckoff_found:
+                        market_context += "\n📊 WYCKOFF PATTERNS DETECTED:\n"
+                        wyckoff_found = True
+                    market_context += "🟢 LONG-TERM (100 candles - LOW PRIORITY for 12h):\n"
+                    market_context += self._format_wyckoff_pattern(pattern)
+                    # Calculate distance for long-term patterns
+                    if pattern.get("pattern") in ["distribution", "accumulation"]:
+                        level_key = "resistance_level" if pattern["pattern"] == "distribution" else "support_level"
+                        level = pattern.get(level_key)
+                        if level:
+                            distance_pct = abs((level - market_data.current_price) / market_data.current_price * 100)
+                            if distance_pct > 10:
+                                market_context += f"  ⚠️ NOTE: {distance_pct:.1f}% from current price - LESS RELEVANT for 12h trading\n"
 
         # Add reversal context if provided
         reversal_context = ""
@@ -1270,7 +1329,13 @@ Your response must be valid JSON with this structure:
     "reasoning": "<detailed explanation>"
 }
 
+SIGNAL PRIORITY for 12h trading (evaluate signals in this order):
+1. HIGH PRIORITY: Short-term MAs (SMA5/10, EMA9), short-term Wyckoff patterns (if present), volume spikes, reversal signals
+2. MEDIUM PRIORITY: RSI, liquidity zones, medium-term Wyckoff patterns
+3. LOW PRIORITY: Long-term Wyckoff patterns (ONLY if within 10% of current price), Fear & Greed Index (use contrarian), SMA50
+
 Consider the news sentiment, technical indicators (RSI, moving averages, Fear & Greed Index), liquidity zones (support/resistance levels), volume analysis, Wyckoff patterns, and any reversal signals in your analysis.
+Weight short-term signals more heavily for 12h predictions. Long-term patterns far from current price should be de-emphasized.
 Reversal signals and liquidity zones are important as they often precede significant price movements.
 Wyckoff patterns indicate smart money activity: Distribution (bearish - selling into strength), Accumulation (bullish - buying into weakness), and Failed Breakouts (traps/liquidity grabs).
 When price is near support with high volume, it may indicate capitulation and a buying opportunity.
@@ -1302,6 +1367,35 @@ Provide your analysis in JSON format as specified."""
                 key_points=[f"Analysis error: {str(e)}"],
                 reasoning="Failed to analyze sentiment due to an error"
             )
+
+    def _format_wyckoff_pattern(self, pattern: Dict) -> str:
+        """Format a Wyckoff pattern for display in market context"""
+        if not pattern:
+            return ""
+
+        output = ""
+        if pattern["pattern"] == "distribution":
+            output += f"  - Pattern: DISTRIBUTION (Bearish)\n"
+            output += f"  - Resistance Level: ${pattern['resistance_level']:,.2f} tested {pattern['test_count']} times\n"
+            if pattern.get('volume_declining'):
+                output += "  - Volume declining on tests (classic distribution signature)\n"
+            output += "  - Indicates smart money selling into strength - Bearish signal\n"
+        elif pattern["pattern"] == "accumulation":
+            output += f"  - Pattern: ACCUMULATION (Bullish)\n"
+            output += f"  - Support Level: ${pattern['support_level']:,.2f} tested {pattern['test_count']} times\n"
+            if pattern.get('volume_declining'):
+                output += "  - Volume declining on tests (classic accumulation signature)\n"
+            output += "  - Indicates smart money buying into weakness - Bullish signal\n"
+        elif pattern["pattern"] == "failed_breakout":
+            if pattern['type'] == "bull_trap":
+                output += f"  - Pattern: BULL TRAP (Bearish)\n"
+                output += f"  - Failed breakout above ${pattern['trap_level']:,.2f}\n"
+                output += "  - Liquidity grab above resistance, likely to reverse down\n"
+            elif pattern['type'] == "bear_trap":
+                output += f"  - Pattern: BEAR TRAP (Bullish)\n"
+                output += f"  - Failed breakdown below ${pattern['trap_level']:,.2f}\n"
+                output += "  - Liquidity grab below support, likely to reverse up\n"
+        return output
 
     def _prepare_articles_text(self, articles: List[NewsArticle]) -> str:
         """Prepare articles for analysis"""
@@ -1385,6 +1479,61 @@ class BitcoinTradingAdvisor:
 
         return {"type": "none"}
 
+    def _format_wyckoff_pattern(self, pattern: Dict) -> str:
+        """Format a Wyckoff pattern for display in market context"""
+        if not pattern:
+            return ""
+
+        output = ""
+        if pattern["pattern"] == "distribution":
+            output += f"  - Pattern: DISTRIBUTION (Bearish)\n"
+            output += f"  - Resistance Level: ${pattern['resistance_level']:,.2f} tested {pattern['test_count']} times\n"
+            if pattern.get('volume_declining'):
+                output += "  - Volume declining on tests (classic distribution signature)\n"
+            output += "  - Indicates smart money selling into strength - Bearish signal\n"
+        elif pattern["pattern"] == "accumulation":
+            output += f"  - Pattern: ACCUMULATION (Bullish)\n"
+            output += f"  - Support Level: ${pattern['support_level']:,.2f} tested {pattern['test_count']} times\n"
+            if pattern.get('volume_declining'):
+                output += "  - Volume declining on tests (classic accumulation signature)\n"
+            output += "  - Indicates smart money buying into weakness - Bullish signal\n"
+        elif pattern["pattern"] == "failed_breakout":
+            if pattern['type'] == "bull_trap":
+                output += f"  - Pattern: BULL TRAP (Bearish)\n"
+                output += f"  - Failed breakout above ${pattern['trap_level']:,.2f}\n"
+                output += "  - Liquidity grab above resistance, likely to reverse down\n"
+            elif pattern['type'] == "bear_trap":
+                output += f"  - Pattern: BEAR TRAP (Bullish)\n"
+                output += f"  - Failed breakdown below ${pattern['trap_level']:,.2f}\n"
+                output += "  - Liquidity grab below support, likely to reverse up\n"
+        return output
+
+    def _print_wyckoff_pattern(self, pattern: Dict, indent: str = "  ") -> None:
+        """Print a Wyckoff pattern with the specified indentation"""
+        if not pattern:
+            return
+
+        if pattern["pattern"] == "distribution":
+            print(f"{indent}Pattern: DISTRIBUTION (BEARISH)")
+            print(f"{indent}Resistance: ${pattern['resistance_level']:,.2f} tested {pattern['test_count']}x")
+            if pattern.get('volume_declining'):
+                print(f"{indent}Volume: Declining (classic distribution)")
+            print(f"{indent}Signal: Smart money selling - BEARISH")
+        elif pattern["pattern"] == "accumulation":
+            print(f"{indent}Pattern: ACCUMULATION (BULLISH)")
+            print(f"{indent}Support: ${pattern['support_level']:,.2f} tested {pattern['test_count']}x")
+            if pattern.get('volume_declining'):
+                print(f"{indent}Volume: Declining (classic accumulation)")
+            print(f"{indent}Signal: Smart money buying - BULLISH")
+        elif pattern["pattern"] == "failed_breakout":
+            trap_type = pattern.get('type', '').upper()
+            print(f"{indent}Pattern: {trap_type}")
+            print(f"{indent}Trap Level: ${pattern.get('trap_level', 0):,.2f}")
+            if pattern.get('type') == "bull_trap":
+                print(f"{indent}Signal: Failed breakout - BEARISH")
+            else:
+                print(f"{indent}Signal: Failed breakdown - BULLISH")
+
     def generate_recommendation(
         self,
         sentiment: SentimentAnalysis,
@@ -1410,8 +1559,14 @@ Your response must be valid JSON with this structure:
     "reasoning": "<detailed explanation>"
 }
 
+SIGNAL PRIORITY for 12h trading (evaluate signals in this order):
+1. HIGH PRIORITY: Short-term MAs (SMA5/10, EMA9), short-term Wyckoff patterns (if present), volume spikes, reversal signals
+2. MEDIUM PRIORITY: RSI, liquidity zones, medium-term Wyckoff patterns
+3. LOW PRIORITY: Long-term Wyckoff patterns (ONLY if within 10% of current price), Fear & Greed Index (use contrarian), SMA50
+
 Use technical indicators (RSI, moving averages), market sentiment (Fear & Greed), liquidity zones (support/resistance), volume analysis, Wyckoff patterns, and reversal signals to inform your decision.
-Pay special attention to reversal conditions, Wyckoff patterns, and liquidity zones as they often precede significant price movements.
+Weight short-term signals more heavily for 12h predictions. Long-term patterns far from current price (>10% away) should be de-emphasized or ignored.
+Pay special attention to reversal conditions, short-term Wyckoff patterns, and liquidity zones as they often precede significant price movements.
 Wyckoff patterns reveal smart money activity: Distribution (bearish), Accumulation (bullish), Failed Breakouts (traps).
 Use support levels for stop-loss placement and resistance levels for take-profit targets.
 Consider volume spikes as potential capitulation or exhaustion signals."""
@@ -1459,29 +1614,44 @@ Consider volume spikes as potential capitulation or exhaustion signals."""
                 if market_data.potential_liquidity_zone:
                     market_context += "- ⚠️ AT LIQUIDITY ZONE - Price likely to react here (bounce or break)\n"
 
-            # Wyckoff pattern analysis
-            if market_data.wyckoff_pattern and market_data.wyckoff_pattern != "none":
-                market_context += "\n📊 WYCKOFF PATTERN DETECTED:\n"
-                if market_data.wyckoff_pattern == "distribution":
-                    details = market_data.wyckoff_details
-                    market_context += f"- Pattern: DISTRIBUTION (BEARISH - Smart Money Selling)\n"
-                    market_context += f"- Resistance: ${details['resistance_level']:,.2f} tested {details['test_count']}x\n"
-                    market_context += "- Consider this a SELL signal or avoid buying\n"
-                elif market_data.wyckoff_pattern == "accumulation":
-                    details = market_data.wyckoff_details
-                    market_context += f"- Pattern: ACCUMULATION (BULLISH - Smart Money Buying)\n"
-                    market_context += f"- Support: ${details['support_level']:,.2f} tested {details['test_count']}x\n"
-                    market_context += "- Consider this a BUY signal\n"
-                elif market_data.wyckoff_pattern == "failed_breakout":
-                    details = market_data.wyckoff_details
-                    if details['type'] == "bull_trap":
-                        market_context += f"- Pattern: BULL TRAP (BEARISH)\n"
-                        market_context += f"- Failed breakout at ${details['trap_level']:,.2f}\n"
-                        market_context += "- Expect reversal DOWN - Bearish signal\n"
-                    elif details['type'] == "bear_trap":
-                        market_context += f"- Pattern: BEAR TRAP (BULLISH)\n"
-                        market_context += f"- Failed breakdown at ${details['trap_level']:,.2f}\n"
-                        market_context += "- Expect reversal UP - Bullish signal\n"
+            # Wyckoff pattern analysis (multi-timeframe)
+            if market_data.wyckoff_patterns:
+                wyckoff_found = False
+
+                # Priority 1: Short-term patterns (most relevant for 12h)
+                if market_data.wyckoff_patterns.get("short_term"):
+                    pattern = market_data.wyckoff_patterns["short_term"]
+                    if not wyckoff_found:
+                        market_context += "\n📊 WYCKOFF PATTERNS DETECTED:\n"
+                        wyckoff_found = True
+                    market_context += "🔴 SHORT-TERM (20 candles - HIGHEST PRIORITY for 12h):\n"
+                    market_context += self._format_wyckoff_pattern(pattern)
+
+                # Priority 2: Medium-term patterns
+                if market_data.wyckoff_patterns.get("medium_term"):
+                    pattern = market_data.wyckoff_patterns["medium_term"]
+                    if not wyckoff_found:
+                        market_context += "\n📊 WYCKOFF PATTERNS DETECTED:\n"
+                        wyckoff_found = True
+                    market_context += "🟡 MEDIUM-TERM (50 candles - MEDIUM PRIORITY):\n"
+                    market_context += self._format_wyckoff_pattern(pattern)
+
+                # Priority 3: Long-term patterns (lowest priority, note distance)
+                if market_data.wyckoff_patterns.get("long_term"):
+                    pattern = market_data.wyckoff_patterns["long_term"]
+                    if not wyckoff_found:
+                        market_context += "\n📊 WYCKOFF PATTERNS DETECTED:\n"
+                        wyckoff_found = True
+                    market_context += "🟢 LONG-TERM (100 candles - LOW PRIORITY for 12h):\n"
+                    market_context += self._format_wyckoff_pattern(pattern)
+                    # Calculate distance for long-term patterns
+                    if pattern.get("pattern") in ["distribution", "accumulation"]:
+                        level_key = "resistance_level" if pattern["pattern"] == "distribution" else "support_level"
+                        level = pattern.get(level_key)
+                        if level:
+                            distance_pct = abs((level - market_data.current_price) / market_data.current_price * 100)
+                            if distance_pct > 10:
+                                market_context += f"  ⚠️ NOTE: {distance_pct:.1f}% from current price - LESS RELEVANT for 12h trading\n"
 
         # Add reversal context
         reversal_context = ""
@@ -2075,8 +2245,7 @@ class BitcoinTradingBot:
                 "volume_ratio": market_data.volume_ratio,
                 "volume_spike": market_data.volume_spike,
                 "potential_liquidity_zone": market_data.potential_liquidity_zone,
-                "wyckoff_pattern": market_data.wyckoff_pattern,
-                "wyckoff_details": market_data.wyckoff_details
+                "wyckoff_patterns": market_data.wyckoff_patterns
             },
             "reversal_signal": reversal_signal,
             "sentiment": {
@@ -2119,6 +2288,32 @@ class BitcoinTradingBot:
         print(f" Evaluation format saved to {evaluation_file}")
 
         return evaluation_format
+
+    def _print_wyckoff_pattern(self, pattern: Dict, indent: str = "  ") -> None:
+        """Print a Wyckoff pattern with the specified indentation"""
+        if not pattern:
+            return
+
+        if pattern["pattern"] == "distribution":
+            print(f"{indent}Pattern: DISTRIBUTION (BEARISH)")
+            print(f"{indent}Resistance: ${pattern['resistance_level']:,.2f} tested {pattern['test_count']}x")
+            if pattern.get('volume_declining'):
+                print(f"{indent}Volume: Declining (classic distribution)")
+            print(f"{indent}Signal: Smart money selling - BEARISH")
+        elif pattern["pattern"] == "accumulation":
+            print(f"{indent}Pattern: ACCUMULATION (BULLISH)")
+            print(f"{indent}Support: ${pattern['support_level']:,.2f} tested {pattern['test_count']}x")
+            if pattern.get('volume_declining'):
+                print(f"{indent}Volume: Declining (classic accumulation)")
+            print(f"{indent}Signal: Smart money buying - BULLISH")
+        elif pattern["pattern"] == "failed_breakout":
+            trap_type = pattern.get('type', '').upper()
+            print(f"{indent}Pattern: {trap_type}")
+            print(f"{indent}Trap Level: ${pattern.get('trap_level', 0):,.2f}")
+            if pattern.get('type') == "bull_trap":
+                print(f"{indent}Signal: Failed breakout - BEARISH")
+            else:
+                print(f"{indent}Signal: Failed breakdown - BULLISH")
 
     def _display_results(self, results: Dict):
         """Display analysis results in a formatted way"""
@@ -2195,31 +2390,40 @@ class BitcoinTradingBot:
                     if mkt.get('potential_liquidity_zone'):
                         print(f"  WARNING: AT LIQUIDITY ZONE - High probability of price reaction")
 
-                # Wyckoff pattern section
-                if mkt.get('wyckoff_pattern') and mkt['wyckoff_pattern'] != "none":
-                    print()
-                    print("Wyckoff Pattern:")
-                    details = mkt.get('wyckoff_details', {})
-                    if mkt['wyckoff_pattern'] == "distribution":
-                        print(f"  Pattern: DISTRIBUTION (BEARISH)")
-                        print(f"  Resistance: ${details.get('resistance_level', 0):,.2f} tested {details.get('test_count', 0)}x")
-                        if details.get('volume_declining'):
-                            print(f"  Volume: Declining (classic distribution)")
-                        print(f"  Signal: Smart money selling - BEARISH")
-                    elif mkt['wyckoff_pattern'] == "accumulation":
-                        print(f"  Pattern: ACCUMULATION (BULLISH)")
-                        print(f"  Support: ${details.get('support_level', 0):,.2f} tested {details.get('test_count', 0)}x")
-                        if details.get('volume_declining'):
-                            print(f"  Volume: Declining (classic accumulation)")
-                        print(f"  Signal: Smart money buying - BULLISH")
-                    elif mkt['wyckoff_pattern'] == "failed_breakout":
-                        trap_type = details.get('type', '').upper()
-                        print(f"  Pattern: {trap_type}")
-                        print(f"  Trap Level: ${details.get('trap_level', 0):,.2f}")
-                        if details.get('type') == "bull_trap":
-                            print(f"  Signal: Failed breakout - BEARISH")
-                        else:
-                            print(f"  Signal: Failed breakdown - BULLISH")
+                # Wyckoff pattern section (multi-timeframe)
+                wyckoff_patterns = mkt.get('wyckoff_patterns')
+                if wyckoff_patterns:
+                    # Check if any patterns exist
+                    has_patterns = any(wyckoff_patterns.get(tf) for tf in ["short_term", "medium_term", "long_term"])
+
+                    if has_patterns:
+                        print()
+                        print("Wyckoff Patterns (Multi-Timeframe):")
+
+                        # Short-term (highest priority)
+                        if wyckoff_patterns.get('short_term'):
+                            print(f"  🔴 SHORT-TERM (20 candles - HIGHEST PRIORITY for 12h):")
+                            self._print_wyckoff_pattern(wyckoff_patterns['short_term'], indent="    ")
+
+                        # Medium-term
+                        if wyckoff_patterns.get('medium_term'):
+                            print(f"  🟡 MEDIUM-TERM (50 candles - MEDIUM PRIORITY):")
+                            self._print_wyckoff_pattern(wyckoff_patterns['medium_term'], indent="    ")
+
+                        # Long-term
+                        if wyckoff_patterns.get('long_term'):
+                            print(f"  🟢 LONG-TERM (100 candles - LOW PRIORITY for 12h):")
+                            self._print_wyckoff_pattern(wyckoff_patterns['long_term'], indent="    ")
+                            # Note distance for long-term patterns
+                            pattern = wyckoff_patterns['long_term']
+                            current_price = mkt.get('current_price', 0)
+                            if pattern.get('pattern') in ['distribution', 'accumulation'] and current_price > 0:
+                                level_key = "resistance_level" if pattern['pattern'] == "distribution" else "support_level"
+                                level = pattern.get(level_key)
+                                if level:
+                                    distance_pct = abs((level - current_price) / current_price * 100)
+                                    if distance_pct > 10:
+                                        print(f"    ⚠️ NOTE: {distance_pct:.1f}% from current price - LESS RELEVANT for 12h")
 
                 print()
 
