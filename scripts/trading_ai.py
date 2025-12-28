@@ -1877,6 +1877,59 @@ Provide your recommendation in JSON format as specified."""
                     return json.loads(response[start:end])
                 raise ValueError("No valid JSON found in response")
 
+    def validate_recommendation_consistency(
+        self,
+        recommendation: TradingRecommendation,
+        bounce_pattern: Dict,
+        wyckoff_patterns: Dict,
+        reversal_signal: Dict,
+        market_data: MarketData
+    ) -> Dict:
+        """
+        Validate that AI recommendation is consistent with detected patterns.
+        Prevents hallucinations where AI claims patterns that don't exist.
+
+        Returns dict with:
+            - is_valid: bool
+            - warnings: List[str] of inconsistencies found
+            - overridden: bool (if recommendation was changed)
+        """
+        warnings = []
+
+        # Check bounce pattern consistency
+        if bounce_pattern.get('pattern') == 'none':
+            # AI should NOT claim bounce pattern in reasoning
+            reasoning_lower = recommendation.reasoning.lower()
+            if any(phrase in reasoning_lower for phrase in ['bounce pattern detected', 'bounce pattern is', 'oversold bounce', 'overbought rejection']):
+                warnings.append("AI claimed bounce pattern but none detected - hallucination!")
+
+        # Check Wyckoff pattern consistency
+        has_bullish_wyckoff = False
+        has_bearish_wyckoff = False
+
+        for timeframe, pattern in wyckoff_patterns.items():
+            if pattern:
+                if pattern.get('pattern') in ['accumulation', 'bear_trap']:
+                    has_bullish_wyckoff = True
+                elif pattern.get('pattern') in ['distribution', 'bull_trap']:
+                    has_bearish_wyckoff = True
+
+        # If AI recommends BUY but no bullish signals exist, flag it
+        if recommendation.action == "buy" and not has_bullish_wyckoff and bounce_pattern.get('pattern') == 'none':
+            if reversal_signal.get('type') == 'none':
+                warnings.append(f"BUY recommendation but no bullish Wyckoff, bounce, or reversal detected")
+
+        # If AI recommends SELL but no bearish signals exist, flag it
+        if recommendation.action == "sell" and not has_bearish_wyckoff and bounce_pattern.get('pattern') == 'none':
+            if reversal_signal.get('type') == 'none':
+                warnings.append(f"SELL recommendation but no bearish Wyckoff, bounce, or reversal detected")
+
+        return {
+            'is_valid': len(warnings) == 0,
+            'warnings': warnings,
+            'overridden': False
+        }
+
     def validate_and_fix_recommendation(
         self,
         recommendation: TradingRecommendation,
@@ -2186,6 +2239,106 @@ class BitcoinTradingBot:
         print(f"  - Confidence: {recommendation.confidence:.1f}%")
         print()
 
+        # Validate recommendation consistency (check for hallucinations)
+        consistency_validation = self.trading_advisor.validate_recommendation_consistency(
+            recommendation=recommendation,
+            bounce_pattern=bounce_pattern,
+            wyckoff_patterns=market_data.wyckoff_patterns,
+            reversal_signal=reversal_signal,
+            market_data=market_data
+        )
+
+        # If validation found issues, determine smart override
+        if not consistency_validation['is_valid'] and len(consistency_validation['warnings']) > 0:
+            print(f"⚠️  Recommendation validation warnings:")
+            for warning in consistency_validation['warnings']:
+                print(f"    - {warning}")
+
+            # Check if hallucination is critical
+            critical_hallucination = any('hallucination' in w.lower() for w in consistency_validation['warnings'])
+
+            if critical_hallucination:
+                print(f"🚫 CRITICAL HALLUCINATION DETECTED - Using pattern-based override")
+
+                # Store original recommendation
+                original_action = recommendation.action
+
+                # SMART OVERRIDE: Use actual detected patterns in priority order
+                override_action = None
+                override_reasoning = ""
+                override_confidence = 65.0  # Medium confidence for overrides
+
+                # PRIORITY 1: Bounce Pattern (Highest)
+                if bounce_pattern.get('pattern') != 'none':
+                    override_action = bounce_pattern['signal'].lower()
+                    override_reasoning = f"Override based on {bounce_pattern['pattern']}: {bounce_pattern['reasoning']}"
+                    override_confidence = 75.0 if bounce_pattern['strength'] == 'strong' else 65.0
+                    print(f"  → Using BOUNCE PATTERN: {override_action.upper()}")
+
+                # PRIORITY 2: Reversal Signal
+                elif reversal_signal.get('type') != 'none':
+                    if 'bullish' in reversal_signal['type'] or 'oversold' in reversal_signal['type']:
+                        override_action = 'buy'
+                        override_reasoning = f"Override based on reversal: {reversal_signal['type']}"
+                        override_confidence = 70.0
+                        print(f"  → Using REVERSAL SIGNAL: BUY")
+                    elif 'bearish' in reversal_signal['type'] or 'overbought' in reversal_signal['type']:
+                        override_action = 'sell'
+                        override_reasoning = f"Override based on reversal: {reversal_signal['type']}"
+                        override_confidence = 70.0
+                        print(f"  → Using REVERSAL SIGNAL: SELL")
+
+                # PRIORITY 3: Short-term Wyckoff
+                elif market_data.wyckoff_patterns.get('short_term'):
+                    pattern = market_data.wyckoff_patterns['short_term']
+                    if pattern['pattern'] in ['accumulation', 'bear_trap']:
+                        override_action = 'buy'
+                        override_reasoning = f"Override based on short-term Wyckoff {pattern['pattern']}"
+                        override_confidence = 70.0
+                        print(f"  → Using SHORT-TERM WYCKOFF: BUY")
+                    elif pattern['pattern'] in ['distribution', 'bull_trap']:
+                        override_action = 'sell'
+                        override_reasoning = f"Override based on short-term Wyckoff {pattern['pattern']}"
+                        override_confidence = 70.0
+                        print(f"  → Using SHORT-TERM WYCKOFF: SELL")
+
+                # PRIORITY 4: Medium-term Wyckoff
+                elif market_data.wyckoff_patterns.get('medium_term'):
+                    pattern = market_data.wyckoff_patterns['medium_term']
+                    if pattern['pattern'] in ['accumulation', 'bear_trap']:
+                        override_action = 'buy'
+                        override_reasoning = f"Override based on medium-term Wyckoff {pattern['pattern']}"
+                        override_confidence = 65.0
+                        print(f"  → Using MEDIUM-TERM WYCKOFF: BUY")
+                    elif pattern['pattern'] in ['distribution', 'bull_trap']:
+                        override_action = 'sell'
+                        override_reasoning = f"Override based on medium-term Wyckoff {pattern['pattern']}"
+                        override_confidence = 65.0
+                        print(f"  → Using MEDIUM-TERM WYCKOFF: SELL")
+
+                # DEFAULT: HOLD if no patterns detected
+                else:
+                    override_action = 'hold'
+                    override_reasoning = "No clear patterns detected after hallucination - defaulting to HOLD"
+                    override_confidence = 0.0
+                    print(f"  → No patterns available: HOLD")
+
+                # Apply override
+                recommendation = TradingRecommendation(
+                    action=override_action,
+                    confidence=override_confidence,
+                    entry_price=current_price if override_action != 'hold' else None,
+                    stop_loss=None,  # Will be calculated by validate_and_fix_recommendation
+                    take_profit=None,  # Will be calculated by validate_and_fix_recommendation
+                    position_size_percentage=5.0 if override_action != 'hold' else 0.0,
+                    reasoning=f"OVERRIDDEN: AI hallucinated. Original: {original_action}. {override_reasoning}. Warnings: {consistency_validation['warnings']}"
+                )
+
+                consistency_validation['overridden'] = True
+                consistency_validation['original_action'] = original_action
+                consistency_validation['override_action'] = override_action
+            print()
+
         # Fetch ATR hourly data early for validation (before any other processing)
         atr_hourly_value = None
         ohlcv_hourly = None
@@ -2419,7 +2572,8 @@ class BitcoinTradingBot:
             "position_sizing": position_details,
             "hybrid_stop_loss": hybrid_stop if hybrid_stop else None,
             "blocked_recommendation": blocked_recommendation if blocked_recommendation else None,
-            "validation_info": validation_info if validation_info else None
+            "validation_info": validation_info if validation_info else None,
+            "consistency_validation": consistency_validation
         }
 
         # Display results
