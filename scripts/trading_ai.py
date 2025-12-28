@@ -1586,6 +1586,17 @@ class BitcoinTradingAdvisor:
 
         # PATTERN 1: OVERSOLD BOUNCE (Bullish)
         if wyckoff_accumulation and price_oversold:
+            # RSI SAFETY CHECK for OVERSOLD BOUNCE
+            if market_data.rsi_14 and market_data.rsi_14 > 60:
+                # RSI is overbought - don't buy into it
+                return {
+                    "pattern": "none",
+                    "strength": None,
+                    "signal": None,
+                    "reasoning": f"Oversold bounce pattern detected BUT RSI {market_data.rsi_14:.1f} is overbought (>60) - BLOCKED for safety"
+                }
+
+            # Pattern is valid
             strength = "strong" if volume_confirmation else "moderate"
             reasoning = f"OVERSOLD BOUNCE detected on {wyckoff_timeframe}: "
             reasoning += f"Wyckoff accumulation pattern + price below {ma_reference} (oversold)"
@@ -1605,6 +1616,17 @@ class BitcoinTradingAdvisor:
 
         # PATTERN 2: OVERBOUGHT REJECTION (Bearish)
         if wyckoff_distribution and price_overbought:
+            # RSI SAFETY CHECK for OVERBOUGHT REJECTION
+            if market_data.rsi_14 and market_data.rsi_14 < 40:
+                # RSI is oversold - don't sell into it
+                return {
+                    "pattern": "none",
+                    "strength": None,
+                    "signal": None,
+                    "reasoning": f"Overbought rejection pattern detected BUT RSI {market_data.rsi_14:.1f} is oversold (<40) - BLOCKED for safety"
+                }
+
+            # Pattern is valid
             strength = "strong" if volume_confirmation else "moderate"
             reasoning = f"OVERBOUGHT REJECTION detected on {wyckoff_timeframe}: "
             reasoning += f"Wyckoff distribution pattern + price above {ma_reference} (overbought)"
@@ -1644,6 +1666,17 @@ class BitcoinTradingAdvisor:
 
         # PATTERN 4: DISTRIBUTION BREAKDOWN (Bearish - price below MAs)
         if wyckoff_distribution and price_oversold:
+            # RSI SAFETY CHECK for DISTRIBUTION BREAKDOWN
+            if market_data.rsi_14 and market_data.rsi_14 < 40:
+                # RSI too oversold - risky to sell, might bounce
+                return {
+                    "pattern": "none",
+                    "strength": None,
+                    "signal": None,
+                    "reasoning": f"Distribution breakdown pattern detected BUT RSI {market_data.rsi_14:.1f} is oversold (<40) - high bounce risk, BLOCKED"
+                }
+
+            # Pattern is valid
             # Distribution happening at lower prices = breakdown/capitulation
             strength = "strong" if volume_confirmation else "moderate"
             reasoning = f"DISTRIBUTION BREAKDOWN detected on {wyckoff_timeframe}: "

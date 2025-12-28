@@ -531,36 +531,56 @@ class BacktestRunner:
                     elif market_data.wyckoff_patterns.get('short_term'):
                         pattern = market_data.wyckoff_patterns['short_term']
                         if pattern['pattern'] in ['accumulation', 'bear_trap']:
-                            override_action = 'buy'
-                            override_reasoning = f"Override based on short-term Wyckoff {pattern['pattern']}"
-                            override_confidence = 70.0
-                            print(f"      → Using SHORT-TERM WYCKOFF: BUY")
+                            # Check RSI before BUY override
+                            if market_data.rsi_14 and market_data.rsi_14 > 60:
+                                print(f"      → SHORT-TERM WYCKOFF suggests BUY but RSI {market_data.rsi_14:.1f} is overbought - SKIPPING")
+                                override_action = None  # Skip this override
+                            else:
+                                override_action = 'buy'
+                                override_reasoning = f"Override based on short-term Wyckoff {pattern['pattern']}"
+                                override_confidence = 70.0
+                                print(f"      → Using SHORT-TERM WYCKOFF: BUY")
                         elif pattern['pattern'] in ['distribution', 'bull_trap']:
-                            override_action = 'sell'
-                            override_reasoning = f"Override based on short-term Wyckoff {pattern['pattern']}"
-                            override_confidence = 70.0
-                            print(f"      → Using SHORT-TERM WYCKOFF: SELL")
+                            # Check RSI before SELL override
+                            if market_data.rsi_14 and market_data.rsi_14 < 40:
+                                print(f"      → SHORT-TERM WYCKOFF suggests SELL but RSI {market_data.rsi_14:.1f} is oversold - SKIPPING")
+                                override_action = None  # Skip this override
+                            else:
+                                override_action = 'sell'
+                                override_reasoning = f"Override based on short-term Wyckoff {pattern['pattern']}"
+                                override_confidence = 70.0
+                                print(f"      → Using SHORT-TERM WYCKOFF: SELL")
 
                     # PRIORITY 4: Medium-term Wyckoff
                     elif market_data.wyckoff_patterns.get('medium_term'):
                         pattern = market_data.wyckoff_patterns['medium_term']
                         if pattern['pattern'] in ['accumulation', 'bear_trap']:
-                            override_action = 'buy'
-                            override_reasoning = f"Override based on medium-term Wyckoff {pattern['pattern']}"
-                            override_confidence = 65.0
-                            print(f"      → Using MEDIUM-TERM WYCKOFF: BUY")
+                            # Check RSI before BUY override
+                            if market_data.rsi_14 and market_data.rsi_14 > 60:
+                                print(f"      → MEDIUM-TERM WYCKOFF suggests BUY but RSI {market_data.rsi_14:.1f} is overbought - SKIPPING")
+                                override_action = None  # Skip this override
+                            else:
+                                override_action = 'buy'
+                                override_reasoning = f"Override based on medium-term Wyckoff {pattern['pattern']}"
+                                override_confidence = 65.0
+                                print(f"      → Using MEDIUM-TERM WYCKOFF: BUY")
                         elif pattern['pattern'] in ['distribution', 'bull_trap']:
-                            override_action = 'sell'
-                            override_reasoning = f"Override based on medium-term Wyckoff {pattern['pattern']}"
-                            override_confidence = 65.0
-                            print(f"      → Using MEDIUM-TERM WYCKOFF: SELL")
+                            # Check RSI before SELL override
+                            if market_data.rsi_14 and market_data.rsi_14 < 40:
+                                print(f"      → MEDIUM-TERM WYCKOFF suggests SELL but RSI {market_data.rsi_14:.1f} is oversold - SKIPPING")
+                                override_action = None  # Skip this override
+                            else:
+                                override_action = 'sell'
+                                override_reasoning = f"Override based on medium-term Wyckoff {pattern['pattern']}"
+                                override_confidence = 65.0
+                                print(f"      → Using MEDIUM-TERM WYCKOFF: SELL")
 
-                    # DEFAULT: HOLD if no patterns detected
-                    else:
+                    # DEFAULT: HOLD if no patterns detected OR all overrides blocked by RSI
+                    if override_action is None:
                         override_action = 'hold'
-                        override_reasoning = "No clear patterns detected after hallucination - defaulting to HOLD"
+                        override_reasoning = "No clear patterns detected after hallucination OR RSI safety blocked all signals - defaulting to HOLD"
                         override_confidence = 0.0
-                        print(f"      → No patterns available: HOLD")
+                        print(f"      → No safe patterns available: HOLD")
 
                     # Calculate stop-loss and take-profit for override
                     override_stop = None
