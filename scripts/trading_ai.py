@@ -416,7 +416,8 @@ class MarketDataFetcher:
         target_price: Optional[float],
         action: str,  # "buy" or "sell"
         portfolio_value: float,
-        timeframe: str = "1h"  # Timeframe for ATR calculation
+        timeframe: str = "1h",  # Timeframe for ATR calculation
+        is_bounce_pattern: bool = False  # Relaxed R/R for bounce patterns
     ) -> Dict:
         """
         Calculate hybrid stop-loss with ATR, R/R validation, and leverage optimization.
@@ -428,6 +429,7 @@ class MarketDataFetcher:
             action: Trade direction ("buy" or "sell")
             portfolio_value: Total portfolio value in USD
             timeframe: Timeframe for ATR calculation (default "1h" for 12h evaluation window)
+            is_bounce_pattern: Whether this is a bounce pattern trade (relaxed R/R: 1:1 vs 1:2)
 
         Returns:
             Dictionary with comprehensive stop-loss and leverage analysis
@@ -458,6 +460,12 @@ class MarketDataFetcher:
         risk_reward_ratio = None
         meets_rr_minimum = False
 
+        # Check if this is a bounce pattern trade - these get relaxed R/R requirements
+        if is_bounce_pattern:
+            min_rr_ratio = 1.0  # Bounce patterns: 1:1 minimum (high probability short-term)
+        else:
+            min_rr_ratio = 2.0  # Regular trades: 1:2 minimum
+
         if target_price and target_price > 0:
             if action.lower() == "buy":
                 potential_profit = target_price - entry_price
@@ -468,7 +476,7 @@ class MarketDataFetcher:
 
             if potential_loss > 0:
                 risk_reward_ratio = round(potential_profit / potential_loss, 2)
-                meets_rr_minimum = risk_reward_ratio >= 2.0
+                meets_rr_minimum = risk_reward_ratio >= min_rr_ratio
 
         # Leverage optimization analysis
         leverage_levels = [1, 2, 3, 5, 10]
@@ -1496,9 +1504,22 @@ class BitcoinTradingAdvisor:
         - Volume > 1.5x average (distribution/exhaustion confirmation)
         Signal: Strong SELL - Smart money selling overbought rally
 
+        PATTERN 3 - ACCUMULATION CONSOLIDATION (Bullish):
+        - Wyckoff shows Accumulation phase (any timeframe)
+        - Price above SMA(20) OR SMA(50) (consolidating)
+        - Volume > 1.5x average (smart money accumulation confirmation)
+        Signal: Strong BUY - Bullish continuation/breakout setup
+
+        PATTERN 4 - DISTRIBUTION BREAKDOWN (Bearish):
+        - Wyckoff shows Distribution phase (any timeframe)
+        - Price below SMA(20) OR SMA(50) (breaking down)
+        - Volume > 1.5x average (distribution confirmation)
+        Signal: Strong SELL - Bearish continuation/breakdown setup
+
         Returns:
             Dict with keys:
-                - pattern: "oversold_bounce", "overbought_rejection", or "none"
+                - pattern: "oversold_bounce", "overbought_rejection",
+                          "accumulation_consolidation", "distribution_breakdown", or "none"
                 - strength: "strong" or "moderate"
                 - signal: "BUY", "SELL", or None
                 - reasoning: explanation string
@@ -1595,6 +1616,46 @@ class BitcoinTradingAdvisor:
 
             return {
                 "pattern": "overbought_rejection",
+                "strength": strength,
+                "signal": "SELL",
+                "reasoning": reasoning,
+                "wyckoff_timeframe": wyckoff_timeframe
+            }
+
+        # PATTERN 3: ACCUMULATION CONSOLIDATION (Bullish - price above MAs)
+        if wyckoff_accumulation and price_overbought:
+            # Accumulation happening at higher prices = retest/consolidation
+            strength = "strong" if volume_confirmation else "moderate"
+            reasoning = f"ACCUMULATION CONSOLIDATION detected on {wyckoff_timeframe}: "
+            reasoning += f"Wyckoff accumulation pattern + price above {ma_reference} (consolidating gains)"
+            if volume_confirmation:
+                reasoning += f" + high volume ({volume_ratio:.1f}x avg) confirms smart money accumulation. "
+                reasoning += "Bullish continuation setup - breakout likely."
+            else:
+                reasoning += ". Moderate setup - volume confirmation would strengthen signal."
+
+            return {
+                "pattern": "accumulation_consolidation",
+                "strength": strength,
+                "signal": "BUY",
+                "reasoning": reasoning,
+                "wyckoff_timeframe": wyckoff_timeframe
+            }
+
+        # PATTERN 4: DISTRIBUTION BREAKDOWN (Bearish - price below MAs)
+        if wyckoff_distribution and price_oversold:
+            # Distribution happening at lower prices = breakdown/capitulation
+            strength = "strong" if volume_confirmation else "moderate"
+            reasoning = f"DISTRIBUTION BREAKDOWN detected on {wyckoff_timeframe}: "
+            reasoning += f"Wyckoff distribution pattern + price below {ma_reference} (breaking down)"
+            if volume_confirmation:
+                reasoning += f" + high volume ({volume_ratio:.1f}x avg) confirms distribution. "
+                reasoning += "Bearish continuation setup - further downside likely."
+            else:
+                reasoning += ". Moderate setup - volume confirmation would strengthen signal."
+
+            return {
+                "pattern": "distribution_breakdown",
                 "strength": strength,
                 "signal": "SELL",
                 "reasoning": reasoning,
@@ -2412,13 +2473,17 @@ class BitcoinTradingBot:
             if not ohlcv_hourly:
                 ohlcv_hourly = self.market_data_fetcher.get_btc_ohlcv(timeframe='1h', limit=100)
             if ohlcv_hourly:
+                # Check if this is a bounce pattern trade
+                is_bounce_pattern = bounce_pattern.get('pattern') != 'none'
+
                 hybrid_stop = self.market_data_fetcher.calculate_hybrid_stop_loss(
                     ohlcv_data=ohlcv_hourly,
                     entry_price=recommendation.entry_price or current_price,
                     target_price=recommendation.take_profit,
                     action=recommendation.action,
                     portfolio_value=portfolio_value,
-                    timeframe='1h'
+                    timeframe='1h',
+                    is_bounce_pattern=is_bounce_pattern
                 )
                 if hybrid_stop and hybrid_stop.get("atr_value"):
                     print(f"  Hybrid Stop-Loss Calculated")
@@ -2433,8 +2498,13 @@ class BitcoinTradingBot:
 
                     # Safety filter: Block trades with poor R/R ratio
                     if hybrid_stop.get('risk_reward_ratio') and not hybrid_stop['meets_rr_minimum']:
+                        # Determine minimum R/R based on trade type
+                        min_rr = 1.0 if is_bounce_pattern else 2.0
+                        min_rr_label = "1:1" if is_bounce_pattern else "1:2"
+                        trade_type = "bounce pattern" if is_bounce_pattern else "regular"
+
                         print()
-                        print(f"  WARNING: TRADE BLOCKED: Risk/Reward ratio too low ({hybrid_stop['risk_reward_ratio']}:1 < 1:2 minimum)")
+                        print(f"  WARNING: TRADE BLOCKED: Risk/Reward ratio too low ({hybrid_stop['risk_reward_ratio']}:1 < {min_rr_label} minimum for {trade_type} trades)")
 
                         # Save original recommendation (if not already blocked by exchange failure)
                         if not blocked_recommendation:
@@ -2451,7 +2521,7 @@ class BitcoinTradingBot:
                         entry = recommendation.entry_price or current_price
                         atr_stop = hybrid_stop['atr_stop_loss']
                         risk_amount = abs(entry - atr_stop)
-                        required_profit = risk_amount * 2.0  # 1:2 minimum
+                        required_profit = risk_amount * min_rr  # Use appropriate minimum
 
                         if recommendation.action.lower() == "buy":
                             required_target = entry + required_profit
@@ -2460,7 +2530,7 @@ class BitcoinTradingBot:
 
                         # Override recommendation to HOLD
                         new_reasoning = (
-                            f"Trade blocked - Risk/Reward ratio of {hybrid_stop['risk_reward_ratio']}:1 is below the 1:2 minimum threshold. "
+                            f"Trade blocked - Risk/Reward ratio of {hybrid_stop['risk_reward_ratio']}:1 is below the {min_rr_label} minimum threshold for {trade_type} trades. "
                             f"The ATR-based stop loss at ${atr_stop:,.2f} would require a target of ${required_target:,.2f} to meet minimum R/R. "
                             f"Current target of ${recommendation.take_profit:,.2f} is insufficient. Waiting for better setup with improved risk/reward."
                         )
@@ -2476,7 +2546,7 @@ class BitcoinTradingBot:
                             reasoning=new_reasoning
                         )
 
-                        print(f"  - Required target for 1:2 R/R: ${required_target:,.2f}")
+                        print(f"  - Required target for {min_rr_label} R/R: ${required_target:,.2f}")
                         print(f"  - Recommendation changed to: HOLD")
         print()
 

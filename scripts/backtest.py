@@ -429,6 +429,25 @@ class BacktestRunner:
             fear_greed_error=None
         )
 
+        # Create advisor instance (needed for pattern detection)
+        print(f"    Initializing AI advisor...")
+        ollama_client = OllamaClient(model="qwen3-coder:30b")
+        advisor = BitcoinTradingAdvisor(ollama_client)
+
+        # Detect reversal signals
+        print(f"    Detecting reversal signals...")
+        reversal_signal = advisor.detect_reversal_conditions(market_data)
+
+        # Detect bounce patterns (HIGHEST PRIORITY)
+        print(f"    Detecting bounce patterns (Wyckoff + MA + Volume)...")
+        bounce_pattern = advisor.detect_bounce_patterns(market_data)
+        if bounce_pattern["pattern"] != "none":
+            print(f"      🚨 BOUNCE PATTERN: {bounce_pattern['pattern'].upper()} - {bounce_pattern['signal']}")
+
+        # Store bounce pattern and reversal signal in market_data for validation
+        market_data.bounce_pattern = bounce_pattern
+        market_data.reversal_signal = reversal_signal
+
         # Create neutral sentiment (no historical news available)
         sentiment = SentimentAnalysis(
             sentiment='neutral',
@@ -439,8 +458,6 @@ class BacktestRunner:
 
         # Use REAL BitcoinTradingAdvisor to generate recommendation
         print(f"    Generating recommendation using real AI system...")
-        ollama_client = OllamaClient(model="qwen3-coder:30b")
-        advisor = BitcoinTradingAdvisor(ollama_client)
 
         try:
             recommendation = advisor.generate_recommendation(
@@ -574,6 +591,160 @@ class BacktestRunner:
             print(f"    ⚠️  Validation failed: {e}")
             validation = {'is_valid': True, 'warnings': [], 'error': str(e)}
 
+        # Calculate hybrid stop-loss with R/R validation (same as live trading)
+        print(f"    Calculating hybrid stop-loss and R/R validation...")
+        hybrid_stop = None
+        blocked_recommendation = None
+
+        if recommendation.action.lower() in ["buy", "sell"]:
+            # Check if this is a bounce pattern trade
+            is_bounce_pattern = bounce_pattern.get('pattern') != 'none'
+
+            # For bounce patterns, adjust targets BEFORE R/R validation
+            print(f"      DEBUG: is_bounce_pattern={is_bounce_pattern}, take_profit={recommendation.take_profit}")
+            if is_bounce_pattern:
+                if not recommendation.take_profit:
+                    print(f"      WARNING: Bounce pattern detected but no take_profit set! Using resistance as target.")
+                    # Set initial target to nearest resistance for BUY, support for SELL
+                    if recommendation.action.lower() == 'buy':
+                        recommendation = TradingRecommendation(
+                            action=recommendation.action,
+                            confidence=recommendation.confidence,
+                            entry_price=recommendation.entry_price or current_price,
+                            stop_loss=recommendation.stop_loss,
+                            take_profit=market_data.nearest_resistance,
+                            position_size_percentage=recommendation.position_size_percentage,
+                            reasoning=recommendation.reasoning
+                        )
+                    elif recommendation.action.lower() == 'sell':
+                        recommendation = TradingRecommendation(
+                            action=recommendation.action,
+                            confidence=recommendation.confidence,
+                            entry_price=recommendation.entry_price or current_price,
+                            stop_loss=recommendation.stop_loss,
+                            take_profit=market_data.nearest_support,
+                            position_size_percentage=recommendation.position_size_percentage,
+                            reasoning=recommendation.reasoning
+                        )
+
+                if recommendation.take_profit:
+                    # Pre-calculate ATR for target adjustment
+                    atr = fetcher.calculate_atr(ohlcv_1h, period=14, timeframe='1h')
+
+                    if atr and atr > 0:
+                        if recommendation.action.lower() == 'buy':
+                            # Target should be at least 2x ATR above entry for momentum move
+                            atr_target = current_price + (atr * 2)
+                            # Or 1.5% gain (whichever is larger)
+                            percent_target = current_price * 1.015
+
+                            # Use the larger of: current target, ATR-based, or percentage-based
+                            better_target = max(
+                                recommendation.take_profit,
+                                atr_target,
+                                percent_target
+                            )
+
+                            if better_target > recommendation.take_profit:
+                                print(f"      Bounce pattern detected - adjusting target from ${recommendation.take_profit:,.2f} to ${better_target:,.2f}")
+                                recommendation = TradingRecommendation(
+                                    action=recommendation.action,
+                                    confidence=recommendation.confidence,
+                                    entry_price=recommendation.entry_price,
+                                    stop_loss=recommendation.stop_loss,
+                                    take_profit=better_target,
+                                    position_size_percentage=recommendation.position_size_percentage,
+                                    reasoning=recommendation.reasoning
+                                )
+
+                        elif recommendation.action.lower() == 'sell':
+                            # For SELL bounce patterns, target 2x ATR below or 1.5% drop
+                            atr_target = current_price - (atr * 2)
+                            percent_target = current_price * 0.985
+
+                            better_target = min(
+                                recommendation.take_profit,
+                                atr_target,
+                                percent_target
+                            )
+
+                            if better_target < recommendation.take_profit:
+                                print(f"      Bounce pattern detected - adjusting target from ${recommendation.take_profit:,.2f} to ${better_target:,.2f}")
+                                recommendation = TradingRecommendation(
+                                    action=recommendation.action,
+                                    confidence=recommendation.confidence,
+                                    entry_price=recommendation.entry_price,
+                                    stop_loss=recommendation.stop_loss,
+                                    take_profit=better_target,
+                                    position_size_percentage=recommendation.position_size_percentage,
+                                    reasoning=recommendation.reasoning
+                                )
+
+            hybrid_stop = fetcher.calculate_hybrid_stop_loss(
+                ohlcv_data=ohlcv_1h,
+                entry_price=recommendation.entry_price or current_price,
+                target_price=recommendation.take_profit,
+                action=recommendation.action,
+                portfolio_value=portfolio_value,
+                timeframe='1h',
+                is_bounce_pattern=is_bounce_pattern
+            )
+
+            if hybrid_stop and hybrid_stop.get("atr_value"):
+                print(f"      - ATR Stop Loss: ${hybrid_stop['atr_stop_loss']:,.2f}")
+                if hybrid_stop.get('risk_reward_ratio'):
+                    rr_status = "GOOD" if hybrid_stop['meets_rr_minimum'] else "LOW"
+                    print(f"      - Risk/Reward: 1:{hybrid_stop['risk_reward_ratio']} ({rr_status})")
+
+                # Safety filter: Block trades with poor R/R ratio (same as live trading)
+                if hybrid_stop.get('risk_reward_ratio') and not hybrid_stop['meets_rr_minimum']:
+                    # Determine minimum R/R based on trade type
+                    min_rr = 1.0 if is_bounce_pattern else 2.0
+                    min_rr_label = "1:1" if is_bounce_pattern else "1:2"
+                    trade_type = "bounce pattern" if is_bounce_pattern else "regular"
+
+                    print(f"      ⚠️  TRADE BLOCKED: R/R {hybrid_stop['risk_reward_ratio']}:1 < {min_rr_label} minimum ({trade_type})")
+
+                    # Save original recommendation
+                    blocked_recommendation = {
+                        "action": recommendation.action,
+                        "confidence": recommendation.confidence,
+                        "entry_price": recommendation.entry_price,
+                        "stop_loss": recommendation.stop_loss,
+                        "take_profit": recommendation.take_profit,
+                        "reasoning": recommendation.reasoning
+                    }
+
+                    # Calculate required target for minimum R/R
+                    entry = recommendation.entry_price or current_price
+                    atr_stop = hybrid_stop['atr_stop_loss']
+                    risk_amount = abs(entry - atr_stop)
+                    required_profit = risk_amount * min_rr
+
+                    if recommendation.action.lower() == "buy":
+                        required_target = entry + required_profit
+                    else:  # sell
+                        required_target = entry - required_profit
+
+                    # Override recommendation to HOLD
+                    new_reasoning = (
+                        f"Trade blocked - Risk/Reward ratio of {hybrid_stop['risk_reward_ratio']}:1 is below the {min_rr_label} minimum threshold for {trade_type} trades. "
+                        f"The ATR-based stop loss at ${atr_stop:,.2f} would require a target of ${required_target:,.2f} to meet minimum R/R. "
+                        f"Current target of ${recommendation.take_profit:,.2f} is insufficient. Waiting for better setup with improved risk/reward."
+                    )
+
+                    recommendation = TradingRecommendation(
+                        action="hold",
+                        confidence=recommendation.confidence * 0.5,
+                        entry_price=None,
+                        stop_loss=None,
+                        take_profit=None,
+                        position_size_percentage=0.0,
+                        reasoning=new_reasoning
+                    )
+
+                    print(f"      - Recommendation changed to: HOLD")
+
         # Build prediction in same format as trading_ai.py
         prediction = {
             'timestamp': timestamp.isoformat(),
@@ -609,7 +780,9 @@ class BacktestRunner:
                 'volume_ratio': market_data.volume_ratio,
                 'volume_spike': market_data.volume_spike,
                 'potential_liquidity_zone': market_data.potential_liquidity_zone,
-                'wyckoff_patterns': market_data.wyckoff_patterns
+                'wyckoff_patterns': market_data.wyckoff_patterns,
+                'bounce_pattern': market_data.bounce_pattern if hasattr(market_data, 'bounce_pattern') else {'pattern': 'none'},
+                'reversal_signal': market_data.reversal_signal if hasattr(market_data, 'reversal_signal') else {'type': 'none'}
             },
             'sentiment_analysis': {
                 'sentiment': sentiment.sentiment,
@@ -633,7 +806,9 @@ class BacktestRunner:
                 'stop_loss': recommendation.stop_loss,
                 'take_profit': recommendation.take_profit
             },
-            'consistency_validation': validation
+            'consistency_validation': validation,
+            'hybrid_stop': hybrid_stop,
+            'blocked_recommendation': blocked_recommendation
         }
 
         print(f"    ✅ Prediction generated: {recommendation.action.upper()} ({recommendation.confidence:.0f}% confidence)")
