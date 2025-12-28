@@ -313,11 +313,17 @@ class TradingEvaluator:
         else:
             buy_threshold = 0.0
             sell_threshold = 0.0
-        
+
+        # DEBUG: Print what we're comparing
+        print(f"DEBUG _evaluate_correctness: recommendation={recommendation}, percent_change={percent_change}, confidence={confidence}")
+        print(f"DEBUG thresholds: buy_threshold={buy_threshold if confidence == 'HIGH' else 0.0}, sell_threshold={sell_threshold if confidence == 'HIGH' else -0.5}")
+
         if recommendation == "BUY":
-            return percent_change > buy_threshold
+            result = percent_change >= buy_threshold
+            print(f"DEBUG BUY check: {percent_change} >= {buy_threshold} = {result}")
+            return result
         elif recommendation == "SELL":
-            return percent_change < sell_threshold
+            return percent_change <= sell_threshold
         elif recommendation == "HOLD":
             return -0.5 <= percent_change <= 0.5
         
