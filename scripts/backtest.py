@@ -458,6 +458,122 @@ class BacktestRunner:
                 current_price, market_data, portfolio_value, risk_tolerance
             )
 
+        # Validate recommendation consistency (same as in run_analysis)
+        try:
+            validation = advisor.validate_recommendation_consistency(
+                recommendation=recommendation,
+                bounce_pattern=market_data.bounce_pattern if hasattr(market_data, 'bounce_pattern') else {'pattern': 'none'},
+                wyckoff_patterns=market_data.wyckoff_patterns,
+                reversal_signal=market_data.reversal_signal if hasattr(market_data, 'reversal_signal') else {'type': 'none'},
+                market_data=market_data
+            )
+
+            # If validation found critical hallucinations, apply smart override
+            if not validation['is_valid'] and len(validation['warnings']) > 0:
+                print(f"    ⚠️  Recommendation validation warnings:")
+                for warning in validation['warnings']:
+                    print(f"        - {warning}")
+
+                critical_hallucination = any('hallucination' in w.lower() for w in validation['warnings'])
+
+                if critical_hallucination:
+                    print(f"    🚫 CRITICAL HALLUCINATION - Applying pattern-based override")
+
+                    # Store original recommendation
+                    original_action = recommendation.action
+
+                    # SMART OVERRIDE: Use actual detected patterns in priority order
+                    override_action = None
+                    override_reasoning = ""
+                    override_confidence = 65.0  # Medium confidence for overrides
+
+                    bounce_pattern = market_data.bounce_pattern if hasattr(market_data, 'bounce_pattern') else {'pattern': 'none'}
+                    reversal_signal = market_data.reversal_signal if hasattr(market_data, 'reversal_signal') else {'type': 'none'}
+
+                    # PRIORITY 1: Bounce Pattern (Highest)
+                    if bounce_pattern.get('pattern') != 'none':
+                        override_action = bounce_pattern['signal'].lower()
+                        override_reasoning = f"Override based on {bounce_pattern['pattern']}: {bounce_pattern['reasoning']}"
+                        override_confidence = 75.0 if bounce_pattern['strength'] == 'strong' else 65.0
+                        print(f"      → Using BOUNCE PATTERN: {override_action.upper()}")
+
+                    # PRIORITY 2: Reversal Signal
+                    elif reversal_signal.get('type') != 'none':
+                        if 'bullish' in reversal_signal['type'] or 'oversold' in reversal_signal['type']:
+                            override_action = 'buy'
+                            override_reasoning = f"Override based on reversal: {reversal_signal['type']}"
+                            override_confidence = 70.0
+                            print(f"      → Using REVERSAL SIGNAL: BUY")
+                        elif 'bearish' in reversal_signal['type'] or 'overbought' in reversal_signal['type']:
+                            override_action = 'sell'
+                            override_reasoning = f"Override based on reversal: {reversal_signal['type']}"
+                            override_confidence = 70.0
+                            print(f"      → Using REVERSAL SIGNAL: SELL")
+
+                    # PRIORITY 3: Short-term Wyckoff
+                    elif market_data.wyckoff_patterns.get('short_term'):
+                        pattern = market_data.wyckoff_patterns['short_term']
+                        if pattern['pattern'] in ['accumulation', 'bear_trap']:
+                            override_action = 'buy'
+                            override_reasoning = f"Override based on short-term Wyckoff {pattern['pattern']}"
+                            override_confidence = 70.0
+                            print(f"      → Using SHORT-TERM WYCKOFF: BUY")
+                        elif pattern['pattern'] in ['distribution', 'bull_trap']:
+                            override_action = 'sell'
+                            override_reasoning = f"Override based on short-term Wyckoff {pattern['pattern']}"
+                            override_confidence = 70.0
+                            print(f"      → Using SHORT-TERM WYCKOFF: SELL")
+
+                    # PRIORITY 4: Medium-term Wyckoff
+                    elif market_data.wyckoff_patterns.get('medium_term'):
+                        pattern = market_data.wyckoff_patterns['medium_term']
+                        if pattern['pattern'] in ['accumulation', 'bear_trap']:
+                            override_action = 'buy'
+                            override_reasoning = f"Override based on medium-term Wyckoff {pattern['pattern']}"
+                            override_confidence = 65.0
+                            print(f"      → Using MEDIUM-TERM WYCKOFF: BUY")
+                        elif pattern['pattern'] in ['distribution', 'bull_trap']:
+                            override_action = 'sell'
+                            override_reasoning = f"Override based on medium-term Wyckoff {pattern['pattern']}"
+                            override_confidence = 65.0
+                            print(f"      → Using MEDIUM-TERM WYCKOFF: SELL")
+
+                    # DEFAULT: HOLD if no patterns detected
+                    else:
+                        override_action = 'hold'
+                        override_reasoning = "No clear patterns detected after hallucination - defaulting to HOLD"
+                        override_confidence = 0.0
+                        print(f"      → No patterns available: HOLD")
+
+                    # Calculate stop-loss and take-profit for override
+                    override_stop = None
+                    override_target = None
+                    if override_action == 'buy':
+                        override_stop = current_price * 0.98  # 2% stop-loss
+                        override_target = current_price * 1.04  # 4% take-profit
+                    elif override_action == 'sell':
+                        override_stop = current_price * 1.02  # 2% stop-loss
+                        override_target = current_price * 0.96  # 4% take-profit
+
+                    # Apply override
+                    recommendation = TradingRecommendation(
+                        action=override_action,
+                        confidence=override_confidence,
+                        entry_price=current_price if override_action != 'hold' else None,
+                        stop_loss=override_stop,
+                        take_profit=override_target,
+                        position_size_percentage=5.0 if override_action != 'hold' else 0.0,
+                        reasoning=f"OVERRIDDEN: AI hallucinated. Original: {original_action}. {override_reasoning}. Warnings: {validation['warnings']}"
+                    )
+
+                    validation['overridden'] = True
+                    validation['original_action'] = original_action
+                    validation['override_action'] = override_action
+
+        except Exception as e:
+            print(f"    ⚠️  Validation failed: {e}")
+            validation = {'is_valid': True, 'warnings': [], 'error': str(e)}
+
         # Build prediction in same format as trading_ai.py
         prediction = {
             'timestamp': timestamp.isoformat(),
@@ -516,7 +632,8 @@ class BacktestRunner:
                 'usd_amount': portfolio_value * recommendation.position_size_percentage / 100,
                 'stop_loss': recommendation.stop_loss,
                 'take_profit': recommendation.take_profit
-            }
+            },
+            'consistency_validation': validation
         }
 
         print(f"    ✅ Prediction generated: {recommendation.action.upper()} ({recommendation.confidence:.0f}% confidence)")
@@ -1012,6 +1129,8 @@ def main():
     try:
         start_date = datetime.strptime(args.start_date, '%Y-%m-%d')
         end_date = datetime.strptime(args.end_date, '%Y-%m-%d')
+        # Set end_date to end of day (23:59:59) to include predictions on that day
+        end_date = end_date.replace(hour=23, minute=59, second=59)
     except ValueError as e:
         print(f"❌ Invalid date format: {e}")
         print("   Expected format: YYYY-MM-DD")
