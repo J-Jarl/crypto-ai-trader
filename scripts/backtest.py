@@ -707,7 +707,8 @@ class BacktestRunner:
                 action=recommendation.action,
                 portfolio_value=portfolio_value,
                 timeframe='1h',
-                is_bounce_pattern=is_bounce_pattern
+                is_bounce_pattern=is_bounce_pattern,
+                market_data=market_data
             )
 
             if hybrid_stop and hybrid_stop.get("atr_value"):
@@ -718,52 +719,162 @@ class BacktestRunner:
 
                 # Safety filter: Block trades with poor R/R ratio (same as live trading)
                 if hybrid_stop.get('risk_reward_ratio') and not hybrid_stop['meets_rr_minimum']:
-                    # Determine minimum R/R based on trade type
-                    min_rr = 1.0 if is_bounce_pattern else 2.0
-                    min_rr_label = "1:1" if is_bounce_pattern else "1:2"
-                    trade_type = "bounce pattern" if is_bounce_pattern else "regular"
+                    # CAPITULATION OVERRIDE: Lower R/R requirements for Wyckoff bottoms
+                    is_capitulation = False
+                    if is_bounce_pattern and recommendation.action.lower() == 'buy':
+                        # Check for capitulation conditions (Wyckoff bottom forming)
+                        rsi = market_data.rsi_14 if market_data.rsi_14 else 50
+                        fear_greed = market_data.fear_greed_index if market_data.fear_greed_index else 50
 
-                    print(f"      ⚠️  TRADE BLOCKED: R/R {hybrid_stop['risk_reward_ratio']}:1 < {min_rr_label} minimum ({trade_type})")
+                        # Check for volume decline (confirms accumulation maturing)
+                        volume_declining = False
+                        if hasattr(market_data, 'wyckoff_patterns'):
+                            short_term = market_data.wyckoff_patterns.get('short_term', {})
+                            if short_term and short_term.get('pattern') == 'accumulation':
+                                volume_declining = short_term.get('volume_declining', False)
 
-                    # Save original recommendation
-                    blocked_recommendation = {
-                        "action": recommendation.action,
-                        "confidence": recommendation.confidence,
-                        "entry_price": recommendation.entry_price,
-                        "stop_loss": recommendation.stop_loss,
-                        "take_profit": recommendation.take_profit,
-                        "reasoning": recommendation.reasoning
-                    }
+                        # Capitulation = accumulation + low RSI + extreme fear + VOLUME DECLINING
+                        if rsi < 50 and fear_greed < 30 and volume_declining:
+                            is_capitulation = True
+                            print(f"      🎯 CAPITULATION DETECTED: RSI {rsi:.1f} + F&G {fear_greed} + Volume Declining")
+                            print(f"      → Mature Wyckoff bottom - lowering R/R requirement to 0.75:1")
+                        elif rsi < 50 and fear_greed < 30:
+                            # Conditions met but volume still high - too early
+                            print(f"      ⏳ Early accumulation detected but volume still high - using standard R/R")
 
-                    # Calculate required target for minimum R/R
-                    entry = recommendation.entry_price or current_price
-                    atr_stop = hybrid_stop['atr_stop_loss']
-                    risk_amount = abs(entry - atr_stop)
-                    required_profit = risk_amount * min_rr
+                    # Determine minimum R/R based on trade type and capitulation
+                    if is_capitulation:
+                        min_rr = 0.75  # Relaxed for capitulation bottoms
+                        min_rr_label = "0.75:1"
+                        trade_type = "capitulation bounce"
+                    elif is_bounce_pattern:
+                        min_rr = 1.0
+                        min_rr_label = "1:1"
+                        trade_type = "bounce pattern"
+                    else:
+                        min_rr = 2.0
+                        min_rr_label = "1:2"
+                        trade_type = "regular"
 
-                    if recommendation.action.lower() == "buy":
-                        required_target = entry + required_profit
-                    else:  # sell
-                        required_target = entry - required_profit
+                    # Only block if below the adjusted minimum
+                    if hybrid_stop['risk_reward_ratio'] < min_rr:
+                        print(f"      ⚠️  TRADE BLOCKED: R/R {hybrid_stop['risk_reward_ratio']:.2f}:1 < {min_rr_label} minimum ({trade_type})")
 
-                    # Override recommendation to HOLD
-                    new_reasoning = (
-                        f"Trade blocked - Risk/Reward ratio of {hybrid_stop['risk_reward_ratio']}:1 is below the {min_rr_label} minimum threshold for {trade_type} trades. "
-                        f"The ATR-based stop loss at ${atr_stop:,.2f} would require a target of ${required_target:,.2f} to meet minimum R/R. "
-                        f"Current target of ${recommendation.take_profit:,.2f} is insufficient. Waiting for better setup with improved risk/reward."
-                    )
+                        # Save original recommendation
+                        blocked_recommendation = {
+                            "action": recommendation.action,
+                            "confidence": recommendation.confidence,
+                            "entry_price": recommendation.entry_price,
+                            "stop_loss": recommendation.stop_loss,
+                            "take_profit": recommendation.take_profit,
+                            "reasoning": recommendation.reasoning
+                        }
 
-                    recommendation = TradingRecommendation(
-                        action="hold",
-                        confidence=recommendation.confidence * 0.5,
-                        entry_price=None,
-                        stop_loss=None,
-                        take_profit=None,
-                        position_size_percentage=0.0,
-                        reasoning=new_reasoning
-                    )
+                        # Calculate required target for minimum R/R
+                        entry = recommendation.entry_price or current_price
+                        atr_stop = hybrid_stop['atr_stop_loss']
+                        risk_amount = abs(entry - atr_stop)
+                        required_profit = risk_amount * min_rr
 
-                    print(f"      - Recommendation changed to: HOLD")
+                        if recommendation.action.lower() == "buy":
+                            required_target = entry + required_profit
+                        else:  # sell
+                            required_target = entry - required_profit
+
+                        # Check for DISTRIBUTION DOMINANCE when bounce blocked
+                        distribution_override = False
+                        if is_bounce_pattern and recommendation.action.lower() == 'buy':
+                            # Count distribution patterns across timeframes
+                            distribution_count = 0
+                            accumulation_count = 0
+
+                            for timeframe in ['short_term', 'medium_term', 'long_term']:
+                                pattern = market_data.wyckoff_patterns.get(timeframe)
+                                if pattern:
+                                    if pattern.get('pattern') in ['distribution', 'bull_trap']:
+                                        distribution_count += 1
+                                    elif pattern.get('pattern') in ['accumulation', 'bear_trap']:
+                                        accumulation_count += 1
+
+                            # If 2+ timeframes show distribution, override to SELL
+                            if distribution_count >= 2 and accumulation_count < distribution_count:
+                                # RSI SAFETY CHECK - Don't SELL into oversold conditions
+                                rsi = market_data.rsi_14 if market_data.rsi_14 else 50
+                                fear_greed = market_data.fear_greed_index if market_data.fear_greed_index else 50
+
+                                # Block SELL if oversold (RSI < 35) or extreme fear + low RSI
+                                if rsi < 35:
+                                    print(f"      ⚠️  Distribution dominance detected but RSI {rsi:.1f} too oversold - SKIPPING")
+                                    print(f"      → High bounce risk - keeping HOLD")
+                                    distribution_override = False
+                                elif rsi < 40 and fear_greed < 25:
+                                    print(f"      ⚠️  Distribution dominance detected but RSI {rsi:.1f} + F&G {fear_greed} (extreme oversold + fear) - SKIPPING")
+                                    print(f"      → Extreme fear zone with low RSI - keeping HOLD")
+                                    distribution_override = False
+                                else:
+                                    print(f"      🎯 DISTRIBUTION DOMINANCE: {distribution_count} timeframes bearish")
+                                    print(f"      → Overriding blocked {recommendation.action.upper()} to SELL")
+                                    distribution_override = True
+
+                                # Only create SELL if RSI safety allows it
+                                if distribution_override:
+                                    # Create SELL recommendation with momentum targets
+                                    # Target: 2x ATR below or 1.5% drop (whichever is larger)
+                                    atr_target = current_price - (atr * 2) if atr and atr > 0 else current_price * 0.985
+                                    percent_target = current_price * 0.985  # 1.5% drop
+                                    target_price = min(atr_target, percent_target)
+
+                                    recommendation = TradingRecommendation(
+                                        action='sell',
+                                        confidence=65.0,
+                                        entry_price=current_price,
+                                        stop_loss=market_data.nearest_resistance,  # Stop at resistance
+                                        take_profit=target_price,  # Momentum target
+                                        position_size_percentage=5.0,
+                                        reasoning=f"Distribution dominance override: {distribution_count} timeframes show distribution. Using momentum target (2x ATR or 1.5%). Original {recommendation.action} blocked by R/R {hybrid_stop['risk_reward_ratio']:.2f}:1"
+                                    )
+
+                                    print(f"      - Distribution SELL target: ${target_price:,.2f} (momentum-based)")
+
+                                    # Recalculate R/R for SELL
+                                    hybrid_stop = fetcher.calculate_hybrid_stop_loss(
+                                        ohlcv_data=ohlcv_1h,
+                                        entry_price=current_price,
+                                        target_price=target_price,
+                                        action='sell',
+                                        portfolio_value=portfolio_value,
+                                        timeframe='1h',
+                                        is_bounce_pattern=False,
+                                        market_data=market_data
+                                    )
+
+                                print(f"      - New R/R for SELL: {hybrid_stop.get('risk_reward_ratio', 0):.2f}:1")
+
+                                distribution_override = True
+
+                        # Override recommendation to HOLD (only if not overridden by distribution dominance)
+                        if not distribution_override:
+                            new_reasoning = (
+                                f"Trade blocked - Risk/Reward ratio of {hybrid_stop['risk_reward_ratio']}:1 is below the {min_rr_label} minimum threshold for {trade_type} trades. "
+                                f"The ATR-based stop loss at ${atr_stop:,.2f} would require a target of ${required_target:,.2f} to meet minimum R/R. "
+                                f"Current target of ${recommendation.take_profit:,.2f} is insufficient. Waiting for better setup with improved risk/reward."
+                            )
+
+                            recommendation = TradingRecommendation(
+                                action="hold",
+                                confidence=recommendation.confidence * 0.5,
+                                entry_price=None,
+                                stop_loss=None,
+                                take_profit=None,
+                                position_size_percentage=0.0,
+                                reasoning=new_reasoning
+                            )
+
+                            print(f"      - Recommendation changed to: HOLD")
+                    else:
+                        # R/R meets the adjusted minimum (possibly due to capitulation override)
+                        if is_capitulation:
+                            print(f"      ✅ CAPITULATION OVERRIDE: Trade approved with R/R {hybrid_stop['risk_reward_ratio']:.2f}:1")
 
         # Build prediction in same format as trading_ai.py
         prediction = {

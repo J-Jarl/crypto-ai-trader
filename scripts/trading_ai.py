@@ -417,7 +417,8 @@ class MarketDataFetcher:
         action: str,  # "buy" or "sell"
         portfolio_value: float,
         timeframe: str = "1h",  # Timeframe for ATR calculation
-        is_bounce_pattern: bool = False  # Relaxed R/R for bounce patterns
+        is_bounce_pattern: bool = False,  # Relaxed R/R for bounce patterns
+        market_data: Optional['MarketData'] = None  # For capitulation detection
     ) -> Dict:
         """
         Calculate hybrid stop-loss with ATR, R/R validation, and leverage optimization.
@@ -460,9 +461,31 @@ class MarketDataFetcher:
         risk_reward_ratio = None
         meets_rr_minimum = False
 
+        # Check for capitulation (Wyckoff bottom conditions)
+        is_capitulation = False
+        if is_bounce_pattern and market_data and action.lower() == 'buy':
+            rsi = market_data.rsi_14 if market_data.rsi_14 else 50
+            fear_greed = market_data.fear_greed_index if market_data.fear_greed_index else 50
+
+            # Check for volume decline (confirms accumulation maturing)
+            volume_declining = False
+            if hasattr(market_data, 'wyckoff_patterns'):
+                short_term = market_data.wyckoff_patterns.get('short_term', {})
+                if short_term and short_term.get('pattern') == 'accumulation':
+                    volume_declining = short_term.get('volume_declining', False)
+
+            # Capitulation = accumulation + low RSI + extreme fear + VOLUME DECLINING
+            if rsi < 50 and fear_greed < 30 and volume_declining:
+                is_capitulation = True
+                print(f"  🎯 CAPITULATION DETECTED: RSI {rsi:.1f} + F&G {fear_greed} + Volume Declining")
+                print(f"  → Mature Wyckoff bottom - lowering R/R requirement to 0.75:1")
+            elif rsi < 50 and fear_greed < 30 and not volume_declining:
+                # Conditions met but volume still high - too early
+                print(f"  ⚠️  Early accumulation detected but volume still high - waiting for decline")
+
         # Check if this is a bounce pattern trade - these get relaxed R/R requirements
         if is_bounce_pattern:
-            min_rr_ratio = 1.0  # Bounce patterns: 1:1 minimum (high probability short-term)
+            min_rr_ratio = 0.75 if is_capitulation else 1.0  # Capitulation: 0.75:1, Regular bounce: 1:1
         else:
             min_rr_ratio = 2.0  # Regular trades: 1:2 minimum
 
@@ -2461,6 +2484,62 @@ class BitcoinTradingBot:
                 print(f"  Validation passed - no fixes needed")
         print()
 
+        # DISTRIBUTION DOMINANCE OVERRIDE
+        # When bounce BUY blocked but 2+ timeframes show distribution → SELL
+        if bounce_pattern.get('pattern') != 'none' and bounce_pattern.get('signal', '').lower() == 'buy' and recommendation.action == 'hold':
+            # Count distribution vs accumulation across timeframes
+            distribution_count = 0
+            accumulation_count = 0
+
+            for timeframe in ['short_term', 'medium_term', 'long_term']:
+                pattern = market_data.wyckoff_patterns.get(timeframe)
+                if pattern:
+                    if pattern.get('pattern') in ['distribution', 'bull_trap']:
+                        distribution_count += 1
+                    elif pattern.get('pattern') in ['accumulation', 'bear_trap']:
+                        accumulation_count += 1
+
+            # If 2+ timeframes bearish and distribution dominates
+            if distribution_count >= 2 and accumulation_count < distribution_count:
+                # RSI SAFETY CHECK - Don't SELL into oversold conditions
+                rsi = market_data.rsi_14 if hasattr(market_data, 'rsi_14') and market_data.rsi_14 else 50
+                fear_greed = market_data.fear_greed_index if hasattr(market_data, 'fear_greed_index') and market_data.fear_greed_index else 50
+
+                # Block SELL if oversold or extreme fear + low RSI
+                if rsi < 35:
+                    print(f"⚠️  Distribution dominance detected but RSI {rsi:.1f} too oversold - SKIPPING")
+                    print(f"→ High bounce risk - keeping HOLD")
+                elif rsi < 40 and fear_greed < 25:
+                    print(f"⚠️  Distribution dominance detected but RSI {rsi:.1f} + F&G {fear_greed} (extreme oversold + fear) - SKIPPING")
+                    print(f"→ Extreme fear with low RSI - keeping HOLD")
+                else:
+                    print(f"🎯 DISTRIBUTION DOMINANCE: {distribution_count} timeframes bearish")
+                    print(f"→ Overriding HOLD to SELL")
+
+                    # Calculate momentum target (2x ATR or 1.5% drop)
+                    atr = market_data.atr if hasattr(market_data, 'atr') else None
+                    if atr and atr > 0:
+                        atr_target = current_price - (atr * 2)
+                    else:
+                        atr_target = current_price * 0.985
+
+                    percent_target = current_price * 0.985  # 1.5% drop
+                    target_price = min(atr_target, percent_target)
+
+                    # Create SELL recommendation
+                    recommendation = TradingRecommendation(
+                        action='sell',
+                        confidence=65.0,
+                        entry_price=current_price,
+                        stop_loss=market_data.nearest_resistance,
+                        take_profit=target_price,
+                        position_size_percentage=5.0,
+                        reasoning=f"Distribution dominance override: {distribution_count} timeframes show distribution. Using momentum target (2x ATR or 1.5%)."
+                    )
+
+                    print(f"- Distribution SELL target: ${target_price:,.2f}")
+                print()
+
         # SAFETY CHECK: Force HOLD if all exchanges failed
         blocked_recommendation = None
         if not market_data.exchange_available:
@@ -2516,7 +2595,8 @@ class BitcoinTradingBot:
                     action=recommendation.action,
                     portfolio_value=portfolio_value,
                     timeframe='1h',
-                    is_bounce_pattern=is_bounce_pattern
+                    is_bounce_pattern=is_bounce_pattern,
+                    market_data=market_data
                 )
                 if hybrid_stop and hybrid_stop.get("atr_value"):
                     print(f"  Hybrid Stop-Loss Calculated")
