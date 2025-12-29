@@ -165,23 +165,112 @@ class TradingEvaluator:
     def get_price_change(self, start_time: datetime, hours: int = 24) -> Tuple[float, float]:
         """
         Calculate price change over specified period
-        
+
         Args:
             start_time: Starting timestamp
             hours: Number of hours to measure (default 24)
-            
+
         Returns:
             Tuple of (start_price, end_price, percent_change)
         """
         start_price = self.get_price_at_time(start_time)
         end_time = start_time + timedelta(hours=hours)
         end_price = self.get_price_at_time(end_time)
-        
+
         if start_price and end_price:
             percent_change = ((end_price - start_price) / start_price) * 100
             return start_price, end_price, percent_change
-        
+
         return None, None, None
+
+    def get_evaluation_window(self, prediction: Dict) -> int:
+        """
+        Determine appropriate evaluation window based on pattern type
+
+        Pattern types have different timeframes:
+        - Distribution dominance: 24h (trend continuation takes time)
+        - Accumulation consolidation: 36h (breakout setup)
+        - Bounce patterns: 12h (quick reversals)
+        - Default: 12h
+
+        Args:
+            prediction: The prediction dictionary
+
+        Returns:
+            hours: Number of hours for evaluation window
+        """
+        recommendation = prediction.get('recommendation', {})
+        reasoning = recommendation.get('reasoning', '').lower()
+
+        market_data = prediction.get('market_data', {})
+        bounce_pattern = market_data.get('bounce_pattern', {}).get('pattern', 'none')
+
+        # Distribution dominance - trend continuation (24 hours)
+        if 'distribution dominance' in reasoning:
+            return 24
+
+        # Accumulation consolidation - breakout from consolidation (36 hours)
+        if bounce_pattern == 'accumulation_consolidation':
+            return 36
+
+        # Bounce patterns - quick reversals (12 hours)
+        if bounce_pattern in ['oversold_bounce', 'overbought_rejection', 'distribution_breakdown']:
+            return 12
+
+        # Default for everything else
+        return 12
+
+    def _simulate_trade_execution(self, recommendation: str, entry_price: float,
+                                   stop_loss: Optional[float], take_profit: Optional[float],
+                                   ohlcv_data: list, max_hours: int,
+                                   check_interval_minutes: int = 60) -> tuple:
+        """
+        Simulate realistic trade execution by checking for TP/SL hits
+
+        Args:
+            recommendation: BUY, SELL, or HOLD
+            entry_price: Entry price for the trade
+            stop_loss: Stop loss price (None if not set)
+            take_profit: Take profit price (None if not set)
+            ohlcv_data: Hourly OHLCV candles
+            max_hours: Maximum hours to hold (default 12)
+            check_interval_minutes: How often to check (60 = hourly)
+
+        Returns:
+            (exit_price, exit_hour, exit_reason)
+            exit_reason: 'stop_loss', 'take_profit', 'time_limit', 'no_data'
+        """
+        if not ohlcv_data or len(ohlcv_data) < 2:
+            return None, None, 'no_data'
+
+        # Check each candle for TP/SL hits
+        for i, candle in enumerate(ohlcv_data[1:], start=1):  # Skip entry candle
+            if i > max_hours:
+                break
+
+            high = candle[2]  # High price
+            low = candle[3]   # Low price
+            close = candle[4]  # Close price
+
+            if recommendation.upper() == 'BUY':
+                # Check stop loss first (price dropped below SL)
+                if stop_loss and low <= stop_loss:
+                    return stop_loss, i, 'stop_loss'
+                # Check take profit (price reached TP)
+                if take_profit and high >= take_profit:
+                    return take_profit, i, 'take_profit'
+
+            elif recommendation.upper() == 'SELL':
+                # Check stop loss first (price rose above SL)
+                if stop_loss and high >= stop_loss:
+                    return stop_loss, i, 'stop_loss'
+                # Check take profit (price dropped to TP)
+                if take_profit and low <= take_profit:
+                    return take_profit, i, 'take_profit'
+
+        # No TP/SL hit, exit at time limit
+        final_candle = ohlcv_data[min(max_hours, len(ohlcv_data)-1)]
+        return final_candle[4], max_hours, 'time_limit'
     
     def evaluate_multiple_timeframes(self, prediction: Dict) -> Dict:
         """
@@ -226,36 +315,83 @@ class TradingEvaluator:
 
         return results
 
-    def evaluate_prediction(self, prediction: Dict, hours_forward: int = 12) -> Dict:
+    def evaluate_prediction(self, prediction: Dict, hours_forward: int = None) -> Dict:
         """
         Evaluate a single prediction against actual outcomes
 
         Args:
             prediction: The AI's trading recommendation
-            hours_forward: Hours to look forward for outcome (default 12)
+            hours_forward: Hours to look forward (None = auto-detect from pattern)
 
         Returns:
             Evaluation results dictionary
         """
+        # Auto-detect evaluation window if not specified
+        if hours_forward is None:
+            hours_forward = self.get_evaluation_window(prediction)
+            print(f"  Using {hours_forward}h evaluation window (pattern-based)")
+
         # Extract prediction data
         timestamp_str = prediction.get('timestamp', '')
         recommendation = prediction.get('recommendation', {}).get('action', '').upper()
         confidence = prediction.get('confidence_level', 'UNKNOWN')
         sentiment = prediction.get('sentiment_analysis', {})
-        
+
         # Parse timestamp
         try:
             pred_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
         except:
             print(f"Invalid timestamp format: {timestamp_str}")
             return None
-        
-        # Get actual price movement
-        start_price, end_price, percent_change = self.get_price_change(pred_time, hours_forward)
-        
+
+        # Extract prediction details
+        start_price = prediction.get('current_price')
+        stop_loss = prediction.get('position_sizing', {}).get('stop_loss')
+        take_profit = prediction.get('position_sizing', {}).get('take_profit')
+
+        # Fetch hourly candles for realistic execution simulation
+        end_time = pred_time + timedelta(hours=hours_forward)
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(
+                symbol='BTC/USD',
+                timeframe='1h',
+                since=int(pred_time.timestamp() * 1000),
+                limit=hours_forward + 2  # Extra candles for safety
+            )
+        except Exception as e:
+            print(f"Error fetching OHLCV for execution simulation: {e}")
+            ohlcv = None
+
+        # Simulate realistic trade execution
+        if ohlcv and recommendation.upper() in ['BUY', 'SELL']:
+            exit_price, exit_hour, exit_reason = self._simulate_trade_execution(
+                recommendation=recommendation,
+                entry_price=start_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                ohlcv_data=ohlcv,
+                max_hours=hours_forward
+            )
+
+            if exit_price:
+                end_price = exit_price
+                actual_exit_hour = exit_hour
+            else:
+                # Fallback to end price
+                end_price = ohlcv[-1][4] if ohlcv else start_price
+                actual_exit_hour = hours_forward
+                exit_reason = 'time_limit'
+        else:
+            # HOLD or no data - use simple end price
+            _, end_price, _ = self.get_price_change(pred_time, hours_forward)
+            exit_reason = 'hold' if recommendation.upper() == 'HOLD' else 'no_data'
+            actual_exit_hour = hours_forward
+
         if start_price is None or end_price is None:
             print(f"Could not fetch prices for evaluation at {timestamp_str}")
             return None
+
+        percent_change = ((end_price - start_price) / start_price) * 100 if start_price else 0
         
         # Determine if prediction was correct
         prediction_correct = self._evaluate_correctness(
@@ -283,18 +419,22 @@ class TradingEvaluator:
             'timestamp': timestamp_str,
             'prediction_time': pred_time.isoformat(),
             'evaluation_period_hours': hours_forward,
+            'evaluation_window_hours': hours_forward,
             'recommendation': recommendation,
             'confidence': confidence,
             'sentiment_score': sentiment_score,
             'start_price': start_price,
             'end_price': end_price,
+            'exit_price': end_price,
+            'exit_hour': actual_exit_hour,
+            'exit_reason': exit_reason,
             'percent_change': round(percent_change, 2),
             'prediction_correct': prediction_correct,
             'sentiment_accurate': sentiment_matches_price,
             'hypothetical_pnl': pnl,
             'position_size': position_size
         }
-        
+
         return evaluation
     
     def _evaluate_correctness(self, recommendation: str, percent_change: float, 
@@ -532,11 +672,12 @@ class TradingEvaluator:
 
     def _print_evaluation_summary(self, evaluation: Dict):
         """Print a brief summary of single evaluation"""
-        correct_icon = "✓" if evaluation['prediction_correct'] else "✗"
-        sentiment_icon = "✓" if evaluation['sentiment_accurate'] else "✗"
+        correct_icon = "[PASS]" if evaluation['prediction_correct'] else "[FAIL]"
+        sentiment_icon = "[PASS]" if evaluation['sentiment_accurate'] else "[FAIL]"
 
         print(f"  Recommendation: {evaluation['recommendation']}")
         print(f"  Price Change: {evaluation['percent_change']:+.2f}%")
+        print(f"  Exit: {evaluation.get('exit_reason', 'N/A')} @ {evaluation.get('exit_hour', 0)}h (${evaluation.get('exit_price', 0):,.2f})")
         print(f"  Prediction Correct: {correct_icon}")
         print(f"  Sentiment Accurate: {sentiment_icon}")
         print(f"  Hypothetical PnL: ${evaluation['hypothetical_pnl']:+,.2f}")
@@ -548,9 +689,9 @@ class TradingEvaluator:
         for timeframe in ['4h', '12h', '24h']:
             tf_result = multi_eval.get(timeframe, {})
             if tf_result.get('status') == 'pending':
-                print(f"    {timeframe}: ⏳ {tf_result['message']}")
+                print(f"    {timeframe}: [PENDING] {tf_result['message']}")
             elif 'prediction_correct' in tf_result:
-                correct_icon = "✓" if tf_result['prediction_correct'] else "✗"
+                correct_icon = "[PASS]" if tf_result['prediction_correct'] else "[FAIL]"
                 print(f"    {timeframe}: {correct_icon} {tf_result['percent_change']:+.2f}% | PnL: ${tf_result['hypothetical_pnl']:+,.2f}")
         print()
     
@@ -828,18 +969,18 @@ class TradingEvaluator:
         print(f"\n{'='*60}")
         print(f"TRADING AI PERFORMANCE REPORT")
         print(f"{'='*60}\n")
-        
+
         # Evaluation Summary
         summary = report['evaluation_summary']
-        print(f"📊 EVALUATION SUMMARY")
+        print(f"[EVALUATION SUMMARY]")
         print(f"   Total Predictions: {summary['total_predictions']}")
         print(f"   Evaluation Period: {summary['evaluation_period']}")
         print(f"   Date Range: {summary['date_range']}")
         print()
-        
+
         # Prediction Accuracy
         accuracy = report['prediction_accuracy']
-        print(f"🎯 PREDICTION ACCURACY")
+        print(f"[PREDICTION ACCURACY]")
         print(f"   Overall: {accuracy['overall_accuracy']}%")
         print(f"   Correct: {accuracy['correct_predictions']}")
         print(f"   Incorrect: {accuracy['incorrect_predictions']}")
@@ -848,18 +989,18 @@ class TradingEvaluator:
         for rec_type, stats in accuracy['by_type'].items():
             print(f"      {rec_type}: {stats['accuracy']}% ({stats['count']} predictions)")
         print()
-        
+
         # Sentiment Analysis
         sentiment = report['sentiment_analysis']
-        print(f"💭 SENTIMENT ANALYSIS")
+        print(f"[SENTIMENT ANALYSIS]")
         print(f"   Accuracy: {sentiment['sentiment_accuracy']}%")
         print(f"   Correct: {sentiment['correct_sentiment_predictions']}")
         print(f"   Incorrect: {sentiment['incorrect_sentiment_predictions']}")
         print()
-        
+
         # Trading Performance
         trading = report['trading_performance']
-        print(f"💰 TRADING PERFORMANCE")
+        print(f"[TRADING PERFORMANCE]")
         print(f"   Total Hypothetical PnL: ${trading['total_hypothetical_pnl']:+,.2f}")
         print(f"   Win Rate: {trading['win_rate']}%")
         print(f"   Winning Trades: {trading['winning_trades']}")
@@ -868,16 +1009,16 @@ class TradingEvaluator:
         print(f"   Average Loss: ${trading['average_loss']:,.2f}")
         print(f"   Profit Factor: {trading['profit_factor']}")
         print()
-        
+
         # Contrarian Analysis
         contrarian = report['contrarian_analysis']
-        print(f"🔄 CONTRARIAN STRATEGY ANALYSIS")
+        print(f"[CONTRARIAN STRATEGY ANALYSIS]")
         print(f"   Contrarian Accuracy: {contrarian['contrarian_accuracy']}%")
         print(f"   Contrarian Correct: {contrarian['contrarian_correct_predictions']}")
         print(f"   Contrarian Hypothetical PnL: ${contrarian['contrarian_hypothetical_pnl']:+,.2f}")
         print(f"   Result: {contrarian['performance_comparison']}")
         print()
-        
+
         print(f"{'='*60}\n")
 
     def print_multi_timeframe_report(self, report: Dict):
@@ -888,7 +1029,7 @@ class TradingEvaluator:
 
         comparison = report['timeframe_comparison']
 
-        print(f"⏱️  TIMEFRAME ANALYSIS (4h vs 12h vs 24h)\n")
+        print(f"[TIMEFRAME ANALYSIS] (4h vs 12h vs 24h)\n")
 
         # Print table header
         print(f"{'Metric':<25} {'4h':>12} {'12h':>12} {'24h':>12}")
@@ -925,14 +1066,14 @@ class TradingEvaluator:
 
         # Best timeframe
         if report['best_timeframe']['timeframe']:
-            print(f"🏆 BEST TIMEFRAME")
+            print(f"[BEST TIMEFRAME]")
             print(f"   Winner: {report['best_timeframe']['timeframe']}")
             print(f"   Accuracy: {report['best_timeframe']['accuracy']:.1f}%")
             print(f"   Reason: {report['best_timeframe']['reason']}")
             print()
 
         # Recommendation
-        print(f"💡 RECOMMENDATION")
+        print(f"[RECOMMENDATION]")
         print(f"   {report['summary']['recommendation']}")
         print()
 
@@ -1002,7 +1143,7 @@ def main():
         try:
             start_date = datetime.strptime(args.start_date, '%Y-%m-%d')
         except ValueError:
-            print(f"❌ Invalid start date format: {args.start_date}")
+            print(f"[ERROR] Invalid start date format: {args.start_date}")
             print("   Expected format: YYYY-MM-DD (e.g., 2025-12-16)")
             return
 
@@ -1010,13 +1151,13 @@ def main():
         try:
             end_date = datetime.strptime(args.end_date, '%Y-%m-%d')
         except ValueError:
-            print(f"❌ Invalid end date format: {args.end_date}")
+            print(f"[ERROR] Invalid end date format: {args.end_date}")
             print("   Expected format: YYYY-MM-DD (e.g., 2025-12-20)")
             return
 
     # Validate date range
     if start_date and end_date and start_date > end_date:
-        print(f"❌ Start date ({args.start_date}) cannot be after end date ({args.end_date})")
+        print(f"[ERROR] Start date ({args.start_date}) cannot be after end date ({args.end_date})")
         return
 
     # Initialize evaluator
@@ -1024,7 +1165,7 @@ def main():
 
     # Check if results directory exists
     if not evaluator.results_dir.exists():
-        print(f"❌ Results directory not found: {evaluator.results_dir}")
+        print(f"[ERROR] Results directory not found: {evaluator.results_dir}")
         print("   Please ensure trading_ai.py has generated some predictions first.")
         return
 
@@ -1048,7 +1189,7 @@ def main():
         has_data = any(len(results) > 0 for results in timeframe_results.values())
 
         if not has_data:
-            print("❌ No predictions could be evaluated for any timeframe.")
+            print("[ERROR] No predictions could be evaluated for any timeframe.")
             print("   This could be because:")
             print("   - No prediction files exist")
             if start_date or end_date:
@@ -1096,7 +1237,7 @@ def main():
         )
 
         if not evaluations:
-            print("❌ No predictions could be evaluated.")
+            print("[ERROR] No predictions could be evaluated.")
             print("   This could be because:")
             print("   - No prediction files exist")
             if start_date or end_date:
@@ -1121,7 +1262,7 @@ def main():
 
         evaluator.save_evaluation_results(evaluations, report, filename)
 
-    print("✅ Evaluation complete!")
+    print("[SUCCESS] Evaluation complete!")
     print()
 
 

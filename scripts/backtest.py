@@ -967,7 +967,7 @@ class BacktestRunner:
         Returns:
             Evaluation dict
         """
-        print(f"\n  Evaluating prediction from {timestamp.strftime('%Y-%m-%d %H:%M')} (12h later)")
+        print(f"\n  Evaluating prediction from {timestamp.strftime('%Y-%m-%d %H:%M')} (pattern-based window)")
 
         evaluation = self.evaluator.evaluate_prediction(prediction, hours_forward=12)
 
