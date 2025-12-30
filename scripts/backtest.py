@@ -35,6 +35,7 @@ from trading_ai import (
     TradingRecommendation
 )
 from evaluation_framework import TradingEvaluator
+from data_cache import DataCache
 
 
 class BacktestRunner:
@@ -58,6 +59,10 @@ class BacktestRunner:
 
         # Initialize exchange for historical data
         self.exchange = ccxt.coinbase()
+
+        # Initialize data cache for consistent backtesting
+        self.data_cache = DataCache()
+        print("📦 Data cache initialized")
 
         # Initialize evaluator
         self.evaluator = TradingEvaluator(results_dir=str(self.predictions_dir))
@@ -98,7 +103,7 @@ class BacktestRunner:
 
     def fetch_historical_ohlcv(self, timestamp: datetime, timeframe: str = '1h', limit: int = 200) -> List:
         """
-        Fetch historical OHLCV data at specific timestamp
+        Fetch historical OHLCV data at specific timestamp using cache
 
         Args:
             timestamp: The datetime to fetch data for
@@ -109,13 +114,9 @@ class BacktestRunner:
             List of OHLCV data
         """
         try:
-            since = int(timestamp.timestamp() * 1000)
-            ohlcv = self.exchange.fetch_ohlcv(
-                'BTC/USD',
-                timeframe=timeframe,
-                since=since - (limit * 3600 * 1000),  # Fetch enough history
-                limit=limit
-            )
+            since = int(timestamp.timestamp() * 1000) - (limit * 3600 * 1000)
+            # Use cached data for consistent backtesting
+            ohlcv = self.data_cache.fetch_ohlcv('BTC/USDT', timeframe, since, limit)
             return ohlcv
         except Exception as e:
             print(f"Error fetching historical OHLCV: {e}")
@@ -123,9 +124,7 @@ class BacktestRunner:
 
     def fetch_historical_fear_greed(self, date: datetime) -> Optional[Dict]:
         """
-        Fetch historical Fear & Greed Index for a specific date
-
-        Note: The API supports historical data
+        Fetch historical Fear & Greed Index for a specific date using cache
 
         Args:
             date: The date to fetch Fear & Greed for
@@ -134,73 +133,28 @@ class BacktestRunner:
             Dict with fear_greed_index and classification, or None if unavailable
         """
         try:
-            import requests
-            # Fear & Greed API supports historical data with limit and date format
-            date_str = date.strftime('%d-%m-%Y')
-            url = f"https://api.alternative.me/fng/?limit=10&date_format=world"
+            # Use cached data for consistent backtesting
+            index = self.data_cache.fetch_fear_greed(date)
 
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
+            if index is None:
+                return None
 
-                # Find data for the specific date
-                target_timestamp = int(date.timestamp())
-                for entry in data.get('data', []):
-                    # With date_format=world, timestamp is a date string like "21-12-2025"
-                    # Convert it to a datetime object for comparison
-                    entry_date_str = entry.get('timestamp', '')
-                    if entry_date_str:
-                        try:
-                            entry_date = datetime.strptime(entry_date_str, '%d-%m-%Y')
-                            entry_timestamp = int(entry_date.timestamp())
-                        except (ValueError, AttributeError):
-                            # If parsing fails, try as integer (fallback)
-                            entry_timestamp = int(entry.get('timestamp', 0))
-                    else:
-                        entry_timestamp = 0
+            # Classify the index value
+            if index <= 25:
+                classification = "Extreme Fear"
+            elif index <= 45:
+                classification = "Fear"
+            elif index <= 55:
+                classification = "Neutral"
+            elif index <= 75:
+                classification = "Greed"
+            else:
+                classification = "Extreme Greed"
 
-                    # Match within the same day
-                    if abs(entry_timestamp - target_timestamp) < 86400:
-                        index = int(entry.get('value', 50))
-
-                        # Classify
-                        if index <= 25:
-                            classification = "Extreme Fear"
-                        elif index <= 45:
-                            classification = "Fear"
-                        elif index <= 55:
-                            classification = "Neutral"
-                        elif index <= 75:
-                            classification = "Greed"
-                        else:
-                            classification = "Extreme Greed"
-
-                        return {
-                            'fear_greed_index': index,
-                            'fear_greed_classification': classification
-                        }
-
-                # If exact date not found, use most recent within range
-                if data.get('data'):
-                    entry = data['data'][0]
-                    index = int(entry.get('value', 50))
-                    if index <= 25:
-                        classification = "Extreme Fear"
-                    elif index <= 45:
-                        classification = "Fear"
-                    elif index <= 55:
-                        classification = "Neutral"
-                    elif index <= 75:
-                        classification = "Greed"
-                    else:
-                        classification = "Extreme Greed"
-
-                    return {
-                        'fear_greed_index': index,
-                        'fear_greed_classification': classification
-                    }
-
-            return None
+            return {
+                'fear_greed_index': index,
+                'fear_greed_classification': classification
+            }
 
         except Exception as e:
             print(f"Warning: Could not fetch historical Fear & Greed: {e}")

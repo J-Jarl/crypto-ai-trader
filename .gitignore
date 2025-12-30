@@ -39,3 +39,7 @@ scripts/test_cases.json
 .aider*
 automation.log
 evaluation.log
+
+# Exception: Allow cache .gitignore
+!data/cache/
+!data/cache/.gitignore
