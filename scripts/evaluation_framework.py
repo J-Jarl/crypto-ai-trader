@@ -511,20 +511,20 @@ class TradingEvaluator:
         # Simulate exit
         if recommendation == "BUY":
             # Check if stop loss or take profit hit
-            if exit_price <= stop_loss:
+            if stop_loss and exit_price <= stop_loss:
                 exit_price = stop_loss
-            elif exit_price >= take_profit:
+            elif take_profit and exit_price >= take_profit:
                 exit_price = take_profit
-            
+
             pnl = (exit_price - entry_price) * position_size
-            
+
         elif recommendation == "SELL":
             # Short position
-            if exit_price >= stop_loss:
+            if stop_loss and exit_price >= stop_loss:
                 exit_price = stop_loss
-            elif exit_price <= take_profit:
+            elif take_profit and exit_price <= take_profit:
                 exit_price = take_profit
-            
+
             pnl = (entry_price - exit_price) * position_size
         
         else:

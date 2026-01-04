@@ -474,20 +474,34 @@ class MarketDataFetcher:
                 if short_term and short_term.get('pattern') == 'accumulation':
                     volume_declining = short_term.get('volume_declining', False)
 
-            # Capitulation = accumulation + low RSI + extreme fear + VOLUME DECLINING
-            if rsi < 50 and fear_greed < 30 and volume_declining:
+            # VOLUME CHECK FIRST - Block ALL accumulation BUYs with high volume
+            if not volume_declining:
+                # Volume still elevated - could be:
+                # 1. Early accumulation (not mature yet)
+                # 2. Market maker pump/trap (especially if RSI > 70)
+                # 3. Distribution disguised as accumulation
+                print(f"  ⚠️  Accumulation detected but volume still high - BLOCKING TRADE")
+                if rsi > 70:
+                    print(f"  → RSI {rsi:.1f} OVERBOUGHT + high volume = potential trap!")
+                else:
+                    print(f"  → Volume not declining yet - too early to enter")
+                # Explicitly block this trade - volume must decline before entry
+                is_capitulation = False
+                block_trade_high_volume = True
+            elif rsi < 50 and fear_greed < 30:
+                # Volume declining + oversold + fear = True capitulation
                 is_capitulation = True
                 print(f"  🎯 CAPITULATION DETECTED: RSI {rsi:.1f} + F&G {fear_greed} + Volume Declining")
                 print(f"  → Mature Wyckoff bottom - lowering R/R requirement to 0.75:1")
-            elif rsi < 50 and fear_greed < 30 and not volume_declining:
-                # Conditions met but volume still high - too early
-                print(f"  ⚠️  Early accumulation detected but volume still high - waiting for decline")
 
         # Check if this is a bounce pattern trade - these get relaxed R/R requirements
         if is_bounce_pattern:
             min_rr_ratio = 0.75 if is_capitulation else 1.0  # Capitulation: 0.75:1, Regular bounce: 1:1
         else:
             min_rr_ratio = 2.0  # Regular trades: 1:2 minimum
+
+        # Check volume blocking flag
+        block_trade_high_volume = locals().get('block_trade_high_volume', False)
 
         if target_price and target_price > 0:
             if action.lower() == "buy":
@@ -499,7 +513,12 @@ class MarketDataFetcher:
 
             if potential_loss > 0:
                 risk_reward_ratio = round(potential_profit / potential_loss, 2)
-                meets_rr_minimum = risk_reward_ratio >= min_rr_ratio
+                # Block if volume high OR R/R insufficient
+                if block_trade_high_volume:
+                    meets_rr_minimum = False  # Force fail
+                    print(f"  ⚠️  Volume blocking active - trade will be rejected")
+                else:
+                    meets_rr_minimum = risk_reward_ratio >= min_rr_ratio
 
         # Leverage optimization analysis
         leverage_levels = [1, 2, 3, 5, 10]
