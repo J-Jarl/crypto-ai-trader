@@ -230,6 +230,131 @@ class BacktestRunner:
 
         return indicators
 
+    def detect_liquidity_sweep(self, ohlcv_data, current_price, market_data):
+        """
+        Detect liquidity sweeps and classify as TRAP vs BREAKOUT
+
+        Returns tuple: (classification, score)
+        - 'SELL': Strong trap signals (score <= -2) → Trade the reversal
+        - 'BUY': Strong breakout signals (score >= +2) → Trade continuation
+        - 'HOLD': Uncertain (score -1 to +1) → Wait for clarity
+        - None: No liquidity sweep detected
+        """
+
+        # Step 1: Detect recent spike (>3% move in 1-3 hours)
+        if len(ohlcv_data) < 4:
+            return None, 0
+
+        recent_candles = ohlcv_data[-4:]  # Last 3 hours + current
+        recent_high = max([c[2] for c in recent_candles])
+        recent_low = min([c[3] for c in recent_candles])
+        spike_pct = ((recent_high - recent_low) / recent_low) * 100
+
+        if spike_pct < 3.0:
+            return None, 0  # No significant spike
+
+        # Step 2: Check if price near spike high (within 1%)
+        if current_price < recent_high * 0.99:
+            return None, 0  # Not at elevated level
+
+        print(f"      🚨 LIQUIDITY SWEEP DETECTED: {spike_pct:.1f}% spike in last 3 hours")
+
+        # Step 3: Score TRAP vs BREAKOUT signals (-5 to +5)
+        score = 0
+
+        # === TRAP INDICATORS (-1 each) ===
+
+        # 1. Volume declining after spike (exhaustion)
+        recent_volumes = [c[5] for c in recent_candles]
+        if len(recent_volumes) >= 3:
+            if recent_volumes[-1] < recent_volumes[-2] < recent_volumes[-3]:
+                score -= 1
+                print(f"      📉 TRAP: Volume declining after spike")
+
+        # 2. RSI overbought (>70)
+        rsi = market_data.rsi_14 if market_data.rsi_14 else 50
+        if rsi > 70:
+            score -= 1
+            print(f"      📉 TRAP: RSI {rsi:.1f} overbought")
+
+        # 3. Distribution patterns (2+ timeframes bearish)
+        distribution_count = 0
+        if hasattr(market_data, 'wyckoff_patterns'):
+            for tf in ['short_term', 'medium_term', 'long_term']:
+                pattern = market_data.wyckoff_patterns.get(tf, {})
+                if pattern and pattern.get('pattern') in ['distribution', 'bull_trap']:
+                    distribution_count += 1
+
+        if distribution_count >= 2:
+            score -= 1
+            print(f"      📉 TRAP: Distribution on {distribution_count} timeframes")
+
+        # 4. Sharp spike without consolidation (>4%)
+        if spike_pct > 4.0:
+            score -= 1
+            print(f"      📉 TRAP: Sharp {spike_pct:.1f}% spike without consolidation")
+
+        # 5. Momentum slowing (range shrinking)
+        if len(recent_candles) >= 2:
+            prev_range = recent_candles[-2][2] - recent_candles[-2][3]
+            curr_range = recent_candles[-1][2] - recent_candles[-1][3]
+            if curr_range < prev_range * 0.7:
+                score -= 1
+                print(f"      📉 TRAP: Momentum slowing")
+
+        # === BREAKOUT INDICATORS (+1 each) ===
+
+        # 1. Volume sustained/increasing (real demand)
+        if len(recent_volumes) >= 3:
+            if recent_volumes[-1] >= recent_volumes[-2]:
+                score += 1
+                print(f"      📈 BREAKOUT: Volume sustained")
+
+        # 2. Consolidation above resistance (2+ candles)
+        lookback = ohlcv_data[-20:] if len(ohlcv_data) >= 20 else ohlcv_data
+        resistance = max([c[2] for c in lookback[:-3]]) if len(lookback) > 3 else recent_low
+        candles_above = sum(1 for c in recent_candles if c[4] > resistance)
+        if candles_above >= 2:
+            score += 1
+            print(f"      📈 BREAKOUT: Consolidating above ${resistance:,.0f} resistance")
+
+        # 3. RSI healthy (50-70 range)
+        if 50 < rsi < 70:
+            score += 1
+            print(f"      📈 BREAKOUT: RSI {rsi:.1f} healthy")
+
+        # 4. Accumulation patterns (2+ timeframes bullish)
+        accumulation_count = 0
+        if hasattr(market_data, 'wyckoff_patterns'):
+            for tf in ['short_term', 'medium_term', 'long_term']:
+                pattern = market_data.wyckoff_patterns.get(tf, {})
+                if pattern and pattern.get('pattern') in ['accumulation', 'bear_trap']:
+                    accumulation_count += 1
+
+        if accumulation_count >= 2:
+            score += 1
+            print(f"      📈 BREAKOUT: Accumulation on {accumulation_count} timeframes")
+
+        # 5. Gradual spike (2-3.5% is healthier than >4%)
+        if 2.0 < spike_pct < 3.5:
+            score += 1
+            print(f"      📈 BREAKOUT: Gradual {spike_pct:.1f}% move")
+
+        # Step 4: Classify based on score
+        print(f"      🎯 Score: {score} (≤-2=TRAP | -1 to +1=HOLD | ≥+2=BREAKOUT)")
+
+        if score <= -2:
+            classification = 'SELL'
+            print(f"      ⚠️  CLASSIFICATION: TRAP → SELL the reversal")
+        elif score >= 2:
+            classification = 'BUY'
+            print(f"      ✅ CLASSIFICATION: BREAKOUT → BUY continuation")
+        else:
+            classification = 'HOLD'
+            print(f"      ⏸️  CLASSIFICATION: UNCERTAIN → HOLD")
+
+        return classification, score
+
     def _create_fallback_recommendation(self, current_price: float, market_data: MarketData,
                                          portfolio_value: float, risk_tolerance: str):
         """
@@ -392,42 +517,109 @@ class BacktestRunner:
         print(f"    Detecting reversal signals...")
         reversal_signal = advisor.detect_reversal_conditions(market_data)
 
-        # Detect bounce patterns (HIGHEST PRIORITY)
-        print(f"    Detecting bounce patterns (Wyckoff + MA + Volume)...")
-        bounce_pattern = advisor.detect_bounce_patterns(market_data)
-        if bounce_pattern["pattern"] != "none":
-            print(f"      🚨 BOUNCE PATTERN: {bounce_pattern['pattern'].upper()} - {bounce_pattern['signal']}")
+        # === PRIORITY 1: LIQUIDITY SWEEP DETECTION (HIGHEST PRIORITY) ===
+        # Check for market maker traps - this takes precedence over all patterns
+        print(f"    Detecting liquidity sweeps...")
+        liquidity_classification, liquidity_score = self.detect_liquidity_sweep(
+            ohlcv_1h, current_price, market_data
+        )
+
+        # If liquidity sweep gives strong signal, use it immediately
+        if liquidity_classification and liquidity_classification != 'HOLD':
+            print(f"    🚨 LIQUIDITY SWEEP DETECTED: {liquidity_classification} (score: {liquidity_score})")
+
+            if liquidity_classification == 'SELL':
+                # Market maker trap - SELL into the spike
+                target_price = current_price * 0.985  # 1.5% drop target
+
+                recommendation = TradingRecommendation(
+                    action='sell',
+                    confidence=75.0,
+                    entry_price=current_price,
+                    stop_loss=None,  # Will calculate ATR stop below
+                    take_profit=target_price,
+                    position_size_percentage=5.0,
+                    reasoning=f"Liquidity sweep TRAP detected (score: {liquidity_score}). Trading the reversal with normal risk management."
+                )
+
+                print(f"    ✅ Liquidity sweep override: SELL (skipping pattern detection)")
+
+                # Set dummy bounce pattern and sentiment to avoid errors downstream
+                bounce_pattern = {"pattern": "none"}
+                sentiment = SentimentAnalysis(
+                    sentiment='neutral',
+                    confidence=50.0,
+                    key_points=[],
+                    reasoning='Liquidity sweep detected - skipped sentiment analysis'
+                )
+
+            elif liquidity_classification == 'BUY':
+                # Legitimate breakout - BUY continuation
+                target_price = current_price * 1.015  # 1.5% upside target
+
+                recommendation = TradingRecommendation(
+                    action='buy',
+                    confidence=75.0,
+                    entry_price=current_price,
+                    stop_loss=None,  # Will calculate ATR stop below
+                    take_profit=target_price,
+                    position_size_percentage=5.0,
+                    reasoning=f"Liquidity sweep BREAKOUT confirmed (score: {liquidity_score}). Trading continuation with normal risk management."
+                )
+
+                print(f"    ✅ Liquidity sweep override: BUY (skipping pattern detection)")
+
+                # Set dummy bounce pattern and sentiment to avoid errors downstream
+                bounce_pattern = {"pattern": "none"}
+                sentiment = SentimentAnalysis(
+                    sentiment='neutral',
+                    confidence=50.0,
+                    key_points=[],
+                    reasoning='Liquidity sweep detected - skipped sentiment analysis'
+                )
+
+        else:
+            # No liquidity sweep or uncertain - continue with normal pattern detection
+            print(f"    No strong liquidity sweep signal, continuing with pattern analysis...")
+
+            # === PRIORITY 2: BOUNCE PATTERN DETECTION ===
+            # Detect bounce patterns (runs only if liquidity sweep didn't trigger)
+            print(f"    Detecting bounce patterns (Wyckoff + MA + Volume)...")
+            bounce_pattern = advisor.detect_bounce_patterns(market_data)
+            if bounce_pattern["pattern"] != "none":
+                print(f"      🚨 BOUNCE PATTERN: {bounce_pattern['pattern'].upper()} - {bounce_pattern['signal']}")
+
+            # Create neutral sentiment (no historical news available)
+            sentiment = SentimentAnalysis(
+                sentiment='neutral',
+                confidence=50.0,
+                key_points=['No historical news available - technical analysis only'],
+                reasoning='Backtest mode: Using technical indicators and Wyckoff patterns only'
+            )
+
+            # === PRIORITY 3: AI RECOMMENDATION ===
+            # Use REAL BitcoinTradingAdvisor to generate recommendation
+            print(f"    Generating recommendation using real AI system...")
+
+            try:
+                recommendation = advisor.generate_recommendation(
+                    sentiment=sentiment,
+                    current_price=current_price,
+                    portfolio_value=portfolio_value,
+                    risk_tolerance=risk_tolerance,
+                    market_data=market_data
+                )
+            except Exception as e:
+                print(f"    ⚠️  AI generation failed: {e}")
+                print(f"    Using fallback technical-only mode")
+                # If AI fails, create a basic recommendation from market data
+                recommendation = self._create_fallback_recommendation(
+                    current_price, market_data, portfolio_value, risk_tolerance
+                )
 
         # Store bounce pattern and reversal signal in market_data for validation
         market_data.bounce_pattern = bounce_pattern
         market_data.reversal_signal = reversal_signal
-
-        # Create neutral sentiment (no historical news available)
-        sentiment = SentimentAnalysis(
-            sentiment='neutral',
-            confidence=50.0,
-            key_points=['No historical news available - technical analysis only'],
-            reasoning='Backtest mode: Using technical indicators and Wyckoff patterns only'
-        )
-
-        # Use REAL BitcoinTradingAdvisor to generate recommendation
-        print(f"    Generating recommendation using real AI system...")
-
-        try:
-            recommendation = advisor.generate_recommendation(
-                sentiment=sentiment,
-                current_price=current_price,
-                portfolio_value=portfolio_value,
-                risk_tolerance=risk_tolerance,
-                market_data=market_data
-            )
-        except Exception as e:
-            print(f"    ⚠️  AI generation failed: {e}")
-            print(f"    Using fallback technical-only mode")
-            # If AI fails, create a basic recommendation from market data
-            recommendation = self._create_fallback_recommendation(
-                current_price, market_data, portfolio_value, risk_tolerance
-            )
 
         # Validate recommendation consistency (same as in run_analysis)
         try:
@@ -565,6 +757,7 @@ class BacktestRunner:
             print(f"    ⚠️  Validation failed: {e}")
             validation = {'is_valid': True, 'warnings': [], 'error': str(e)}
 
+        # === PRIORITY 4: HYBRID STOP-LOSS & R/R VALIDATION ===
         # Calculate hybrid stop-loss with R/R validation (same as live trading)
         print(f"    Calculating hybrid stop-loss and R/R validation...")
         hybrid_stop = None
@@ -673,6 +866,9 @@ class BacktestRunner:
 
                 # Safety filter: Block trades with poor R/R ratio (same as live trading)
                 if hybrid_stop.get('risk_reward_ratio') and not hybrid_stop['meets_rr_minimum']:
+                    # LIQUIDITY SWEEP CHECK: Detect if this is a liquidity sweep trade
+                    is_liquidity_sweep = 'Liquidity sweep' in recommendation.reasoning
+
                     # CAPITULATION OVERRIDE: Lower R/R requirements for Wyckoff bottoms
                     is_capitulation = False
                     if is_bounce_pattern and recommendation.action.lower() == 'buy':
@@ -706,16 +902,19 @@ class BacktestRunner:
                             print(f"      → Mature Wyckoff bottom - lowering R/R requirement to 0.75:1")
 
                     # Determine minimum R/R based on trade type and capitulation
-                    if is_capitulation:
-                        min_rr = 0.75  # Relaxed for capitulation bottoms
+                    if is_capitulation or is_liquidity_sweep:
+                        min_rr = 0.75  # Relaxed for capitulation bottoms AND liquidity sweeps
                         min_rr_label = "0.75:1"
-                        trade_type = "capitulation bounce"
+                        if is_liquidity_sweep:
+                            trade_type = "liquidity sweep"
+                        else:
+                            trade_type = "capitulation bounce"
                     elif is_bounce_pattern:
-                        min_rr = 1.0
+                        min_rr = 1.0  # Relaxed for bounce patterns
                         min_rr_label = "1:1"
                         trade_type = "bounce pattern"
                     else:
-                        min_rr = 2.0
+                        min_rr = 2.0  # Regular trades: 1:2 minimum
                         min_rr_label = "1:2"
                         trade_type = "regular"
 
