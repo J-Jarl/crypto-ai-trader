@@ -56,7 +56,7 @@ class DataCache:
         filename = f"{date_str}.json"
         return self.fear_greed_dir / filename
 
-    def fetch_ohlcv(self, symbol: str, timeframe: str, since: int, limit: int) -> List[List]:
+    def fetch_ohlcv(self, symbol: str, timeframe: str, since: int, limit: int, prediction_date: datetime = None) -> List[List]:
         """
         Fetch OHLCV data with smart caching (permanent for old, TTL for recent)
 
@@ -65,19 +65,25 @@ class DataCache:
             timeframe: Candle timeframe (e.g., '1h')
             since: Start timestamp in milliseconds
             limit: Number of candles
+            prediction_date: The date we're making prediction for (for cache naming)
 
         Returns:
             List of OHLCV candles
         """
-        # Determine date range
-        start_date = datetime.fromtimestamp(since / 1000)
-        days_ago = (datetime.now() - start_date).days
+        # Use prediction date for cache if provided, else calculate from since
+        if prediction_date is None:
+            # Calculate end date from since + limit (assuming 1h timeframe)
+            start_date = datetime.fromtimestamp(since / 1000)
+            prediction_date = start_date + timedelta(hours=limit)
+
+        days_ago = (datetime.now() - prediction_date).days
 
         # Determine cache strategy
         is_finalized = days_ago >= 7
         ttl_hours = 2  # TTL for recent data
 
-        cache_path = self.get_ohlcv_cache_path(symbol, timeframe, start_date)
+        # Use prediction_date for cache path (not since date!)
+        cache_path = self.get_ohlcv_cache_path(symbol, timeframe, prediction_date)
         meta_path = cache_path.with_suffix('.meta.json')
 
         # Check cache

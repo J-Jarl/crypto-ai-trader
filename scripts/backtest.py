@@ -116,7 +116,8 @@ class BacktestRunner:
         try:
             since = int(timestamp.timestamp() * 1000) - (limit * 3600 * 1000)
             # Use cached data for consistent backtesting
-            ohlcv = self.data_cache.fetch_ohlcv('BTC/USDT', timeframe, since, limit)
+            # Pass prediction date (timestamp) for correct cache naming
+            ohlcv = self.data_cache.fetch_ohlcv('BTC/USDT', timeframe, since, limit, prediction_date=timestamp)
             return ohlcv
         except Exception as e:
             print(f"Error fetching historical OHLCV: {e}")
