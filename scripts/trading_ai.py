@@ -12,6 +12,14 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass
 import feedparser
 import ccxt
+from regime_detection import (
+    classify_market_regime_custom,
+    get_regime_trading_mode,
+    analyze_volume_profile,
+    detect_order_flow_divergence,
+    check_liquidity_zones
+)
+from trend_system import generate_trend_signal
 
 
 @dataclass
@@ -2465,6 +2473,7 @@ class BitcoinTradingBot:
         self.sentiment_analyzer = BitcoinSentimentAnalyzer(self.ollama)
         self.trading_advisor = BitcoinTradingAdvisor(self.ollama)
         self.market_data_fetcher = MarketDataFetcher()
+        self.trend_signal = None  # For trend following system
 
     def run_analysis(
         self,
@@ -2584,45 +2593,145 @@ class BitcoinTradingBot:
             print(f" No reversal conditions detected")
         print()
 
-        # === PRIORITY 1: LIQUIDITY SWEEP DETECTION (HIGHEST PRIORITY) ===
-        # Check for market maker traps - this takes precedence over all patterns
-        print("Detecting liquidity sweeps...")
+        # Fetch OHLCV data for regime detection and liquidity sweep
         ohlcv_1h = self.market_data_fetcher.get_btc_ohlcv(timeframe='1h', limit=200)
-        liquidity_classification, liquidity_score = None, 0
-        if ohlcv_1h and len(ohlcv_1h) >= 4:
-            liquidity_classification, liquidity_score = self.trading_advisor.detect_liquidity_sweep(
-                ohlcv_1h, current_price, market_data
-            )
-            if liquidity_classification and liquidity_classification != 'HOLD':
-                print(f" 🚨 LIQUIDITY SWEEP DETECTED!")
-                if liquidity_classification == 'SELL':
-                    print(f"  - Classification: TRAP (score: {liquidity_score})")
-                    print(f"  - Signal: SELL the reversal")
-                elif liquidity_classification == 'BUY':
-                    print(f"  - Classification: BREAKOUT (score: {liquidity_score})")
-                    print(f"  - Signal: BUY continuation")
-                print(f"  - ⚠️ This signal may OVERRIDE other patterns!")
-            elif liquidity_classification == 'HOLD':
-                print(f" Liquidity sweep detected but uncertain (score: {liquidity_score}) - waiting for clarity")
+
+        # ============================================================
+        # STEP 1: REGIME DETECTION (Custom Market Structure Analysis)
+        # ============================================================
+        print("Detecting market regime...")
+        regime, reason, regime_confidence, trading_mode = 'CHOPPY', 'insufficient_data', 0, 'volume_blocking'
+
+        if ohlcv_1h and len(ohlcv_1h) >= 50:
+            # Calculate ATR for volatility reference
+            atr_14 = self.market_data_fetcher.calculate_atr(ohlcv_1h, 14, '1h')
+
+            if atr_14:
+                # Calculate market structure for regime detection and trend system
+                volume_profile = analyze_volume_profile(ohlcv_1h, lookback_hours=720)
+                order_flow = detect_order_flow_divergence(ohlcv_1h, lookback=10)
+                liquidity = check_liquidity_zones(ohlcv_1h, lookback_hours=720)
+
+                # Preliminary liquidity sweep check (needed for regime detection)
+                temp_sweep_result = self.trading_advisor.detect_liquidity_sweep(
+                    ohlcv_1h, current_price, market_data
+                )
+
+                # Classify regime using custom market structure
+                regime, reason, regime_confidence = classify_market_regime_custom(
+                    ohlcv_data=ohlcv_1h,
+                    current_price=current_price,
+                    atr_14=atr_14,
+                    liquidity_sweep_result=temp_sweep_result
+                )
+
+                # Get trading mode for this regime
+                trading_mode = get_regime_trading_mode(regime, reason)
+
+                print(f" 🎯 REGIME: {regime} ({reason}) - Confidence: {regime_confidence}%")
+                print(f" 🔧 TRADING MODE: {trading_mode}")
             else:
-                print(f" No liquidity sweep detected")
+                print(f" ⚠️ Insufficient data for ATR, defaulting to CHOPPY regime")
         else:
-            print(f" No liquidity sweep detected (insufficient data)")
+            print(f" ⚠️ Insufficient OHLCV data for regime detection")
         print()
 
-        # === PRIORITY 2: BOUNCE PATTERN DETECTION ===
-        print("Detecting bounce patterns (Wyckoff + MA + Volume)...")
-        bounce_pattern = self.trading_advisor.detect_bounce_patterns(market_data)
-        if bounce_pattern["pattern"] != "none":
-            print(f" 🚨 BOUNCE PATTERN DETECTED!")
-            print(f"  - Pattern: {bounce_pattern['pattern'].upper().replace('_', ' ')}")
-            print(f"  - Signal: {bounce_pattern['signal']} ({bounce_pattern['strength'].upper()})")
-            print(f"  - Timeframe: {bounce_pattern['wyckoff_timeframe'].upper().replace('_', ' ')}")
-            print(f"  - Reasoning: {bounce_pattern['reasoning']}")
-            print(f"  - ⚠️ This signal OVERRIDES conflicting indicators!")
+        # ============================================================
+        # STEP 2: REGIME-AWARE TRADING LOGIC
+        # ============================================================
+
+        liquidity_classification, liquidity_score = None, 0
+        bounce_pattern = {"pattern": "none"}
+
+        if trading_mode == 'liquidity_sweep':
+            # SPIKE REGIME - Use liquidity sweep system
+            print("Detecting liquidity sweeps (SPIKE regime)...")
+            if ohlcv_1h and len(ohlcv_1h) >= 4:
+                liquidity_classification, liquidity_score = temp_sweep_result  # Use pre-calculated result
+                if liquidity_classification and liquidity_classification != 'HOLD':
+                    print(f" 🚨 LIQUIDITY SWEEP DETECTED!")
+                    if liquidity_classification == 'SELL':
+                        print(f"  - Classification: TRAP (score: {liquidity_score})")
+                        print(f"  - Signal: SELL the reversal")
+                    elif liquidity_classification == 'BUY':
+                        print(f"  - Classification: BREAKOUT (score: {liquidity_score})")
+                        print(f"  - Signal: BUY continuation")
+                    print(f"  - ⚠️ This signal may OVERRIDE other patterns!")
+                elif liquidity_classification == 'HOLD':
+                    print(f" Liquidity sweep detected but uncertain (score: {liquidity_score}) - waiting for clarity")
+                else:
+                    print(f" No liquidity sweep detected")
+            else:
+                print(f" No liquidity sweep detected (insufficient data)")
+            print()
+
+        elif trading_mode == 'trend_following':
+            # TRENDING REGIME - Use trend following system
+            print("📈 TRENDING REGIME DETECTED")
+
+            # Generate trend signal
+            trend_signal = generate_trend_signal(
+                ohlcv_data=ohlcv_1h,
+                current_price=current_price,
+                atr_14=atr_14,
+                volume_profile=volume_profile,
+                order_flow=order_flow,
+                liquidity=liquidity
+            )
+
+            # Store for recommendation generation
+            self.trend_signal = trend_signal
+
+            if trend_signal.recommendation != 'HOLD':
+                print(f" ✅ TREND SIGNAL: {trend_signal.recommendation} (confidence: {trend_signal.confidence}%)")
+                print(f" 📊 R/R: {trend_signal.risk_reward:.2f}:1 (Chandelier stops)")
+            print()
+
+        elif trading_mode == 'hold':
+            # LOW_VOL REGIME - Mostly hold
+            print("😴 LOW VOLATILITY REGIME")
+            print(f" Waiting for clearer market setup")
+            print()
+
         else:
-            print(f" No bounce pattern detected")
-        print()
+            # CHOPPY REGIME (trading_mode == 'volume_blocking')
+            # Continue with existing pattern detection
+            print("📊 CHOPPY REGIME - Using pattern detection + volume blocking")
+
+            # Liquidity sweep detection for reference
+            print("Detecting liquidity sweeps...")
+            if ohlcv_1h and len(ohlcv_1h) >= 4:
+                liquidity_classification, liquidity_score = temp_sweep_result  # Use pre-calculated result
+                if liquidity_classification and liquidity_classification != 'HOLD':
+                    print(f" 🚨 LIQUIDITY SWEEP DETECTED!")
+                    if liquidity_classification == 'SELL':
+                        print(f"  - Classification: TRAP (score: {liquidity_score})")
+                        print(f"  - Signal: SELL the reversal")
+                    elif liquidity_classification == 'BUY':
+                        print(f"  - Classification: BREAKOUT (score: {liquidity_score})")
+                        print(f"  - Signal: BUY continuation")
+                    print(f"  - ⚠️ This signal may OVERRIDE other patterns!")
+                elif liquidity_classification == 'HOLD':
+                    print(f" Liquidity sweep detected but uncertain (score: {liquidity_score}) - waiting for clarity")
+                else:
+                    print(f" No liquidity sweep detected")
+            else:
+                print(f" No liquidity sweep detected (insufficient data)")
+            print()
+
+            # Bounce pattern detection
+            print("Detecting bounce patterns (Wyckoff + MA + Volume)...")
+            bounce_pattern = self.trading_advisor.detect_bounce_patterns(market_data)
+            if bounce_pattern["pattern"] != "none":
+                print(f" 🚨 BOUNCE PATTERN DETECTED!")
+                print(f"  - Pattern: {bounce_pattern['pattern'].upper().replace('_', ' ')}")
+                print(f"  - Signal: {bounce_pattern['signal']} ({bounce_pattern['strength'].upper()})")
+                print(f"  - Timeframe: {bounce_pattern['wyckoff_timeframe'].upper().replace('_', ' ')}")
+                print(f"  - Reasoning: {bounce_pattern['reasoning']}")
+                print(f"  - ⚠️ This signal OVERRIDES conflicting indicators!")
+            else:
+                print(f" No bounce pattern detected")
+            print()
 
         # Fetch news articles
         print(f"Fetching Bitcoin news articles (max {max_articles})...")
@@ -2843,6 +2952,45 @@ class BitcoinTradingBot:
 
                     print(f"- Distribution SELL target: ${target_price:,.2f}")
                 print()
+
+        # TREND FOLLOWING OVERRIDE
+        # When in TRENDING regime, use trend system recommendation
+        if hasattr(self, 'trend_signal') and self.trend_signal:
+            trend_signal = self.trend_signal
+
+            if trend_signal.recommendation != 'HOLD':
+                print(f"🎯 TREND FOLLOWING OVERRIDE")
+                print(f"→ Overriding recommendation with trend system: {trend_signal.recommendation}")
+
+                # Convert trend signal to TradingRecommendation
+                if trend_signal.recommendation == 'BUY':
+                    action = 'buy'
+                    position_size = 10.0  # Larger size for trend trades
+                elif trend_signal.recommendation == 'SELL':
+                    action = 'sell'
+                    position_size = 10.0
+                else:
+                    action = 'hold'
+                    position_size = 0.0
+
+                recommendation = TradingRecommendation(
+                    action=action,
+                    confidence=float(trend_signal.confidence),
+                    entry_price=trend_signal.entry_price,
+                    stop_loss=trend_signal.stop_loss if action != 'hold' else None,
+                    take_profit=trend_signal.take_profit if action != 'hold' else None,
+                    position_size_percentage=position_size,
+                    reasoning=f"TREND FOLLOWING: {trend_signal.reason} - R/R: {trend_signal.risk_reward:.2f}:1 (Chandelier stops)"
+                )
+
+                print(f"- Entry: ${trend_signal.entry_price:,.2f}")
+                print(f"- Stop: ${trend_signal.stop_loss:,.2f} (Chandelier)")
+                print(f"- Target: ${trend_signal.take_profit:,.2f}")
+                print(f"- R/R: {trend_signal.risk_reward:.2f}:1")
+                print()
+
+            # Clear the trend signal after use
+            self.trend_signal = None
 
         # SAFETY CHECK: Force HOLD if all exchanges failed
         blocked_recommendation = None
