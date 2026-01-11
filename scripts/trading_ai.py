@@ -1742,7 +1742,7 @@ class BitcoinTradingAdvisor:
 
     def detect_liquidity_sweep(self, ohlcv_data, current_price, market_data):
         """
-        Detect liquidity sweeps and classify as TRAP vs BREAKOUT
+        Detect liquidity sweeps and classify as TRAP vs BREAKOUT (bidirectional)
 
         Returns tuple: (classification, score)
         - 'SELL': Strong trap signals (score <= -2) → Trade the reversal
@@ -1751,119 +1751,250 @@ class BitcoinTradingAdvisor:
         - None: No liquidity sweep detected
         """
 
-        # Step 1: Detect recent spike (>3% move in 1-3 hours)
-        if len(ohlcv_data) < 4:
+        # Step 1: Detect recent spike over 72 hours (3 days) for multi-day sweeps
+        if len(ohlcv_data) < 73:
             return None, 0
 
-        recent_candles = ohlcv_data[-4:]  # Last 3 hours + current
+        recent_candles = ohlcv_data[-73:]  # Last 72 hours (3 days)
         recent_high = max([c[2] for c in recent_candles])
         recent_low = min([c[3] for c in recent_candles])
-        spike_pct = ((recent_high - recent_low) / recent_low) * 100
 
-        if spike_pct < 3.0:
-            return None, 0  # No significant spike
+        # Calculate both directions
+        upward_spike_pct = ((recent_high - recent_low) / recent_low) * 100
+        downward_sweep_pct = ((recent_high - recent_low) / recent_high) * 100
 
-        # Step 2: Check if price near spike high (within 1%)
-        if current_price < recent_high * 0.99:
-            return None, 0  # Not at elevated level
+        # UPWARD SPIKE (existing logic)
+        if upward_spike_pct >= 2.5 and current_price >= recent_high * 0.99:
+            print(f"      🚨 LIQUIDITY SWEEP DETECTED: {upward_spike_pct:.1f}% UPWARD spike")
 
-        print(f"      🚨 LIQUIDITY SWEEP DETECTED: {spike_pct:.1f}% spike in last 3 hours")
+            # Step 3: Score TRAP vs BREAKOUT signals (-5 to +5)
+            score = 0
 
-        # Step 3: Score TRAP vs BREAKOUT signals (-5 to +5)
-        score = 0
+            # === TRAP INDICATORS (-1 each) ===
 
-        # === TRAP INDICATORS (-1 each) ===
+            # 1. Volume declining after spike (exhaustion)
+            recent_volumes = [c[5] for c in recent_candles]
+            if len(recent_volumes) >= 3:
+                if recent_volumes[-1] < recent_volumes[-2] < recent_volumes[-3]:
+                    score -= 1
+                    print(f"      📉 TRAP: Volume declining after spike")
 
-        # 1. Volume declining after spike (exhaustion)
-        recent_volumes = [c[5] for c in recent_candles]
-        if len(recent_volumes) >= 3:
-            if recent_volumes[-1] < recent_volumes[-2] < recent_volumes[-3]:
+            # 2. RSI overbought (>70)
+            rsi = market_data.rsi_14 if market_data.rsi_14 else 50
+            if rsi > 70:
                 score -= 1
-                print(f"      📉 TRAP: Volume declining after spike")
+                print(f"      📉 TRAP: RSI {rsi:.1f} overbought")
 
-        # 2. RSI overbought (>70)
-        rsi = market_data.rsi_14 if market_data.rsi_14 else 50
-        if rsi > 70:
-            score -= 1
-            print(f"      📉 TRAP: RSI {rsi:.1f} overbought")
+            # 3. Distribution patterns (2+ timeframes bearish)
+            distribution_count = 0
+            if hasattr(market_data, 'wyckoff_patterns'):
+                for tf in ['short_term', 'medium_term', 'long_term']:
+                    pattern = market_data.wyckoff_patterns.get(tf, {})
+                    if pattern and pattern.get('pattern') in ['distribution', 'bull_trap']:
+                        distribution_count += 1
 
-        # 3. Distribution patterns (2+ timeframes bearish)
-        distribution_count = 0
-        if hasattr(market_data, 'wyckoff_patterns'):
-            for tf in ['short_term', 'medium_term', 'long_term']:
-                pattern = market_data.wyckoff_patterns.get(tf, {})
-                if pattern and pattern.get('pattern') in ['distribution', 'bull_trap']:
-                    distribution_count += 1
-
-        if distribution_count >= 2:
-            score -= 1
-            print(f"      📉 TRAP: Distribution on {distribution_count} timeframes")
-
-        # 4. Sharp spike without consolidation (>4%)
-        if spike_pct > 4.0:
-            score -= 1
-            print(f"      📉 TRAP: Sharp {spike_pct:.1f}% spike without consolidation")
-
-        # 5. Momentum slowing (range shrinking)
-        if len(recent_candles) >= 2:
-            prev_range = recent_candles[-2][2] - recent_candles[-2][3]
-            curr_range = recent_candles[-1][2] - recent_candles[-1][3]
-            if curr_range < prev_range * 0.7:
+            if distribution_count >= 2:
                 score -= 1
-                print(f"      📉 TRAP: Momentum slowing")
+                print(f"      📉 TRAP: Distribution on {distribution_count} timeframes")
 
-        # === BREAKOUT INDICATORS (+1 each) ===
+            # 4. Sharp spike without consolidation (>4%)
+            if upward_spike_pct > 4.0:
+                score -= 1
+                print(f"      📉 TRAP: Sharp {upward_spike_pct:.1f}% spike without consolidation")
 
-        # 1. Volume sustained/increasing (real demand)
-        if len(recent_volumes) >= 3:
-            if recent_volumes[-1] >= recent_volumes[-2]:
+            # 5. Momentum slowing (range shrinking)
+            if len(recent_candles) >= 2:
+                prev_range = recent_candles[-2][2] - recent_candles[-2][3]
+                curr_range = recent_candles[-1][2] - recent_candles[-1][3]
+                if curr_range < prev_range * 0.7:
+                    score -= 1
+                    print(f"      📉 TRAP: Momentum slowing")
+
+            # === BREAKOUT INDICATORS (+1 each) ===
+
+            # 1. Volume sustained/increasing (real demand)
+            if len(recent_volumes) >= 3:
+                if recent_volumes[-1] >= recent_volumes[-2]:
+                    score += 1
+                    print(f"      📈 BREAKOUT: Volume sustained")
+
+            # 2. Consolidation above resistance (2+ candles)
+            lookback = ohlcv_data[-20:] if len(ohlcv_data) >= 20 else ohlcv_data
+            resistance = max([c[2] for c in lookback[:-3]]) if len(lookback) > 3 else recent_low
+            candles_above = sum(1 for c in recent_candles if c[4] > resistance)
+            if candles_above >= 2:
                 score += 1
-                print(f"      📈 BREAKOUT: Volume sustained")
+                print(f"      📈 BREAKOUT: Consolidating above ${resistance:,.0f} resistance")
 
-        # 2. Consolidation above resistance (2+ candles)
-        lookback = ohlcv_data[-20:] if len(ohlcv_data) >= 20 else ohlcv_data
-        resistance = max([c[2] for c in lookback[:-3]]) if len(lookback) > 3 else recent_low
-        candles_above = sum(1 for c in recent_candles if c[4] > resistance)
-        if candles_above >= 2:
-            score += 1
-            print(f"      📈 BREAKOUT: Consolidating above ${resistance:,.0f} resistance")
+            # 3. RSI healthy (50-70 range)
+            if 50 < rsi < 70:
+                score += 1
+                print(f"      📈 BREAKOUT: RSI {rsi:.1f} healthy")
 
-        # 3. RSI healthy (50-70 range)
-        if 50 < rsi < 70:
-            score += 1
-            print(f"      📈 BREAKOUT: RSI {rsi:.1f} healthy")
+            # 4. Accumulation patterns (2+ timeframes bullish)
+            accumulation_count = 0
+            if hasattr(market_data, 'wyckoff_patterns'):
+                for tf in ['short_term', 'medium_term', 'long_term']:
+                    pattern = market_data.wyckoff_patterns.get(tf, {})
+                    if pattern and pattern.get('pattern') in ['accumulation', 'bear_trap']:
+                        accumulation_count += 1
 
-        # 4. Accumulation patterns (2+ timeframes bullish)
-        accumulation_count = 0
-        if hasattr(market_data, 'wyckoff_patterns'):
-            for tf in ['short_term', 'medium_term', 'long_term']:
-                pattern = market_data.wyckoff_patterns.get(tf, {})
-                if pattern and pattern.get('pattern') in ['accumulation', 'bear_trap']:
-                    accumulation_count += 1
+            if accumulation_count >= 2:
+                score += 1
+                print(f"      📈 BREAKOUT: Accumulation on {accumulation_count} timeframes")
 
-        if accumulation_count >= 2:
-            score += 1
-            print(f"      📈 BREAKOUT: Accumulation on {accumulation_count} timeframes")
+            # 5. Gradual spike (2-3.5% is healthier than >4%)
+            if 2.0 < upward_spike_pct < 3.5:
+                score += 1
+                print(f"      📈 BREAKOUT: Gradual {upward_spike_pct:.1f}% move")
 
-        # 5. Gradual spike (2-3.5% is healthier than >4%)
-        if 2.0 < spike_pct < 3.5:
-            score += 1
-            print(f"      📈 BREAKOUT: Gradual {spike_pct:.1f}% move")
+            # Step 4: Classify based on score
+            print(f"      🎯 Score: {score} (≤-2=TRAP | -1 to +1=HOLD | ≥+2=BREAKOUT)")
 
-        # Step 4: Classify based on score
-        print(f"      🎯 Score: {score} (≤-2=TRAP | -1 to +1=HOLD | ≥+2=BREAKOUT)")
+            if score <= -2:
+                classification = 'SELL'
+                print(f"      ⚠️  CLASSIFICATION: TRAP → SELL the reversal")
 
-        if score <= -2:
-            classification = 'SELL'
-            print(f"      ⚠️  CLASSIFICATION: TRAP → SELL the reversal")
-        elif score >= 2:
-            classification = 'BUY'
-            print(f"      ✅ CLASSIFICATION: BREAKOUT → BUY continuation")
-        else:
-            classification = 'HOLD'
-            print(f"      ⏸️  CLASSIFICATION: UNCERTAIN → HOLD")
+                # Check for late entry (reversal already played out)
+                pullback_pct = ((recent_high - current_price) / recent_high) * 100
+                if pullback_pct > 2.0:
+                    print(f"      ⚠️  LATE ENTRY: Price ${current_price:,.2f} already {pullback_pct:.1f}% below high ${recent_high:,.2f}")
+                    print(f"      ⚠️  Reversal already played out - checking accumulation...")
 
-        return classification, score
+                    # If accumulation present, it's a failed trap → BUY
+                    if accumulation_count >= 2:
+                        classification = 'BUY'
+                        score = 2
+                        print(f"      🔄 OVERRIDE: Late entry + Accumulation ({accumulation_count} timeframes) → BUY continuation")
+                    else:
+                        classification = 'HOLD'
+                        score = 0
+                        print(f"      🔄 OVERRIDE: Late entry without accumulation → HOLD (missed the trade)")
+            elif score >= 2:
+                classification = 'BUY'
+                print(f"      ✅ CLASSIFICATION: BREAKOUT → BUY continuation")
+            else:
+                classification = 'HOLD'
+                print(f"      ⏸️  CLASSIFICATION: UNCERTAIN → HOLD")
+
+            return classification, score
+
+        # DOWNWARD SWEEP - check if we're in recovery zone after the sweep
+        elif downward_sweep_pct >= 2.5 and recent_low * 0.95 <= current_price <= recent_low * 1.05:
+            # Detect if we're within 5% above/below the recent low
+            # This catches V-reversals where price is recovering from bottom
+            # Example: Low $91k, current $92.6k = 1.8% above low (detects!)
+            print(f"      🚨 LIQUIDITY SWEEP DETECTED: {downward_sweep_pct:.1f}% DOWNWARD sweep")
+
+            # Step 3: Score BOTTOM TRAP vs REAL BREAKDOWN signals
+            score = 0
+
+            # === BOTTOM TRAP INDICATORS (+1 each for BUY) ===
+
+            # 1. Volume spike on drop (panic selling)
+            recent_volumes = [c[5] for c in recent_candles]
+            if len(recent_volumes) >= 3:
+                if recent_volumes[-2] > recent_volumes[-3] * 1.5:  # Volume spiked
+                    score += 1
+                    print(f"      📈 BOTTOM TRAP: Volume spike (panic selling)")
+
+            # 2. RSI extremely oversold (<30)
+            rsi = market_data.rsi_14 if market_data.rsi_14 else 50
+            if rsi < 30:
+                score += 1
+                print(f"      📈 BOTTOM TRAP: RSI {rsi:.1f} oversold")
+
+            # 3. Accumulation patterns (2+ timeframes bullish)
+            accumulation_count = 0
+            if hasattr(market_data, 'wyckoff_patterns'):
+                for tf in ['short_term', 'medium_term', 'long_term']:
+                    pattern = market_data.wyckoff_patterns.get(tf, {})
+                    if pattern and pattern.get('pattern') in ['accumulation', 'bear_trap']:
+                        accumulation_count += 1
+
+            if accumulation_count >= 2:
+                score += 1
+                print(f"      📈 BOTTOM TRAP: Accumulation on {accumulation_count} timeframes")
+
+            # 4. Sharp drop (>4% is panic)
+            if downward_sweep_pct > 4.0:
+                score += 1
+                print(f"      📈 BOTTOM TRAP: Sharp {downward_sweep_pct:.1f}% panic drop")
+
+            # 5. Quick reversal (price recovering)
+            if len(recent_candles) >= 2:
+                prev_close = recent_candles[-2][4]
+                curr_close = recent_candles[-1][4]
+                if curr_close > prev_close:  # Recovering
+                    score += 1
+                    print(f"      📈 BOTTOM TRAP: Quick reversal detected")
+
+            # === REAL BREAKDOWN INDICATORS (-1 each for SELL/HOLD) ===
+
+            # 1. Volume declining (weak bounce expected)
+            if len(recent_volumes) >= 3:
+                if recent_volumes[-1] < recent_volumes[-2] < recent_volumes[-3]:
+                    score -= 1
+                    print(f"      📉 BREAKDOWN: Volume declining")
+
+            # 2. RSI weak but not extreme (30-50 = ongoing weakness)
+            if 30 < rsi < 50:
+                score -= 1
+                print(f"      📉 BREAKDOWN: RSI {rsi:.1f} weak")
+
+            # 3. Distribution patterns (2+ timeframes bearish)
+            distribution_count = 0
+            if hasattr(market_data, 'wyckoff_patterns'):
+                for tf in ['short_term', 'medium_term', 'long_term']:
+                    pattern = market_data.wyckoff_patterns.get(tf, {})
+                    if pattern and pattern.get('pattern') in ['distribution', 'bull_trap']:
+                        distribution_count += 1
+
+            if distribution_count >= 2:
+                score -= 1
+                print(f"      📉 BREAKDOWN: Distribution on {distribution_count} timeframes")
+
+            # 4. Continuation (still dropping)
+            if len(recent_candles) >= 2:
+                prev_close = recent_candles[-2][4]
+                curr_close = recent_candles[-1][4]
+                if curr_close < prev_close:  # Still dropping
+                    score -= 1
+                    print(f"      📉 BREAKDOWN: Continuation lower")
+
+            # Step 4: Classify downward sweep
+            print(f"      🎯 Score: {score} (≥+2=BOTTOM TRAP→BUY | -1 to +1=HOLD | ≤-2=BREAKDOWN→SELL)")
+
+            if score >= 2:
+                classification = 'BUY'
+                print(f"      ✅ CLASSIFICATION: BOTTOM TRAP → BUY the reversal")
+
+                # Check for late entry (reversal already played out)
+                recovery_pct = ((current_price - recent_low) / recent_low) * 100
+                if recovery_pct > 2.0:
+                    print(f"      ⚠️  LATE ENTRY: Price ${current_price:,.2f} already {recovery_pct:.1f}% above low ${recent_low:,.2f}")
+                    print(f"      ⚠️  Reversal already played out - checking distribution...")
+
+                    # If distribution present, it's a failed reversal → SELL
+                    if distribution_count >= 2:
+                        classification = 'SELL'
+                        score = -2
+                        print(f"      🔄 OVERRIDE: Late entry + Distribution ({distribution_count} timeframes) → SELL continuation")
+                    else:
+                        classification = 'HOLD'
+                        score = 0
+                        print(f"      🔄 OVERRIDE: Late entry without distribution → HOLD (missed the trade)")
+            elif score <= -2:
+                classification = 'SELL'
+                print(f"      ⚠️  CLASSIFICATION: REAL BREAKDOWN → SELL continuation")
+            else:
+                classification = 'HOLD'
+                print(f"      ⏸️  CLASSIFICATION: UNCERTAIN → HOLD")
+
+            return classification, score
+
+        # No sweep detected
+        return None, 0
 
     def _format_wyckoff_pattern(self, pattern: Dict) -> str:
         """Format a Wyckoff pattern for display in market context"""
