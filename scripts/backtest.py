@@ -36,9 +36,17 @@ from trading_ai import (
 )
 from evaluation_framework import TradingEvaluator
 from data_cache import DataCache
+# Two-layer architecture
+from regime_layer1 import detect_regime_layer1, check_trend_structure_intact
+from regime_layer2 import (
+    detect_liquidity_sweep_event,
+    detect_volume_spike_event,
+    detect_divergence_event
+)
+from decision_matrix import generate_trading_signal
+
+# Keep for CHOPPY fallback
 from regime_detection import (
-    classify_market_regime_custom,
-    get_regime_trading_mode,
     analyze_volume_profile,
     detect_order_flow_divergence,
     check_liquidity_zones
@@ -671,206 +679,63 @@ class BacktestRunner:
         reversal_signal = advisor.detect_reversal_conditions(market_data)
 
         # ============================================================
-        # STEP 1: REGIME DETECTION (Custom Market Structure Analysis)
+        # TWO-LAYER ARCHITECTURE
         # ============================================================
-        print(f"    Detecting market regime...")
+        print("    Detecting market regime (Layer 1)...")
 
-        # Calculate market structure for regime detection and trend system
-        volume_profile = analyze_volume_profile(ohlcv_1h, lookback_hours=720)
-        order_flow = detect_order_flow_divergence(ohlcv_1h, lookback=10)
-        liquidity = check_liquidity_zones(ohlcv_1h, lookback_hours=720)
+        # LAYER 1: Independent regime detection (structure-based)
+        regime, regime_confidence, regime_details = detect_regime_layer1(
+            ohlcv_data=ohlcv_1h,
+            lookback_days=3
+        )
 
-        # Preliminary liquidity sweep check (needed for regime detection)
-        temp_sweep_result = self.detect_liquidity_sweep(ohlcv_1h, current_price, market_data)
+        print("    Detecting market events (Layer 2)...")
 
-        # Classify regime using custom market structure
-        if atr_14:
-            regime, reason, regime_confidence = classify_market_regime_custom(
-                ohlcv_data=ohlcv_1h,
-                current_price=current_price,
-                atr_14=atr_14,
-                liquidity_sweep_result=temp_sweep_result
-            )
+        # LAYER 2: Event detection (sweeps, divergences, volume)
+        sweep_event = detect_liquidity_sweep_event(
+            ohlcv_data=ohlcv_1h,
+            current_price=current_price,
+            market_data=market_data,
+            wyckoff_patterns=wyckoff_patterns
+        )
 
-            # Get trading mode for this regime
-            trading_mode = get_regime_trading_mode(regime, reason)
+        divergence_event = detect_divergence_event(
+            ohlcv_data=ohlcv_1h,
+            market_data=market_data
+        )
 
-            print(f"    🎯 REGIME: {regime} ({reason}) - Confidence: {regime_confidence}%")
-            print(f"    🔧 TRADING MODE: {trading_mode}")
-        else:
-            # Fallback if ATR not available
-            regime = 'CHOPPY'
-            reason = 'insufficient_data'
-            regime_confidence = 0
-            trading_mode = 'volume_blocking'
-            print(f"    ⚠️ Insufficient data for ATR, defaulting to CHOPPY regime")
+        volume_event = detect_volume_spike_event(
+            ohlcv_data=ohlcv_1h
+        )
+
+        # DECISION MATRIX: Combine regime + events
+        signal, signal_confidence, reason, signal_details = generate_trading_signal(
+            regime=regime,
+            regime_confidence=regime_confidence,
+            regime_details=regime_details,
+            sweep_event=sweep_event,
+            divergence_event=divergence_event,
+            volume_event=volume_event,
+            current_price=current_price,
+            market_data=market_data
+        )
 
         # ============================================================
-        # STEP 2: REGIME-AWARE TRADING LOGIC
+        # EXECUTE TRADING SIGNAL
         # ============================================================
 
-        if trading_mode == 'liquidity_sweep':
-            # SPIKE REGIME - Use liquidity sweep system
-            liquidity_classification, liquidity_score = temp_sweep_result  # Already detected above
+        print(f"    🎯 SIGNAL: {signal} (confidence: {signal_confidence}%) - {reason}")
 
-            if liquidity_classification and liquidity_classification != 'HOLD':
-                print(f"    🚨 LIQUIDITY SWEEP DETECTED: {liquidity_classification} (score: {liquidity_score})")
+        # If signal is HOLD and regime is CHOPPY, use pattern detection
+        if signal == 'HOLD' and regime == 'CHOPPY':
+            print("    CHOPPY regime with HOLD signal - using pattern detection")
 
-                if liquidity_classification == 'SELL':
-                    # Market maker trap - SELL into the spike
-                    target_price = current_price * 0.985  # 1.5% drop target
-
-                    recommendation = TradingRecommendation(
-                        action='sell',
-                        confidence=75.0,
-                        entry_price=current_price,
-                        stop_loss=None,  # Will calculate ATR stop below
-                        take_profit=target_price,
-                        position_size_percentage=5.0,
-                        reasoning=f"SPIKE REGIME: Liquidity sweep TRAP detected (score: {liquidity_score}). Trading the reversal with normal risk management."
-                    )
-
-                    print(f"    ✅ Liquidity sweep override: SELL (skipping pattern detection)")
-
-                    # Set dummy bounce pattern and sentiment to avoid errors downstream
-                    bounce_pattern = {"pattern": "none"}
-                    sentiment = SentimentAnalysis(
-                        sentiment='neutral',
-                        confidence=50.0,
-                        key_points=[],
-                        reasoning='Liquidity sweep detected - skipped sentiment analysis'
-                    )
-
-                elif liquidity_classification == 'BUY':
-                    # Legitimate breakout - BUY continuation
-                    target_price = current_price * 1.015  # 1.5% upside target
-
-                    recommendation = TradingRecommendation(
-                        action='buy',
-                        confidence=75.0,
-                        entry_price=current_price,
-                        stop_loss=None,  # Will calculate ATR stop below
-                        take_profit=target_price,
-                        position_size_percentage=5.0,
-                        reasoning=f"SPIKE REGIME: Liquidity sweep BREAKOUT confirmed (score: {liquidity_score}). Trading continuation with normal risk management."
-                    )
-
-                    print(f"    ✅ Liquidity sweep override: BUY (skipping pattern detection)")
-
-                    # Set dummy bounce pattern and sentiment to avoid errors downstream
-                    bounce_pattern = {"pattern": "none"}
-                    sentiment = SentimentAnalysis(
-                        sentiment='neutral',
-                        confidence=50.0,
-                        key_points=[],
-                        reasoning='Liquidity sweep detected - skipped sentiment analysis'
-                    )
-            else:
-                # Liquidity sweep uncertain in SPIKE regime - use pattern detection
-                print(f"    Liquidity sweep uncertain in SPIKE regime, falling back to pattern analysis...")
-                bounce_pattern = advisor.detect_bounce_patterns(market_data)
-                sentiment = SentimentAnalysis(
-                    sentiment='neutral',
-                    confidence=50.0,
-                    key_points=['No historical news available - technical analysis only'],
-                    reasoning='Backtest mode: Using technical indicators and Wyckoff patterns only'
-                )
-                recommendation = advisor.generate_recommendation(
-                    sentiment=sentiment,
-                    current_price=current_price,
-                    portfolio_value=portfolio_value,
-                    risk_tolerance=risk_tolerance,
-                    market_data=market_data
-                )
-
-        elif trading_mode == 'trend_following':
-            # TRENDING REGIME - Use trend following system
-            print(f"    📈 TRENDING REGIME DETECTED")
-
-            # Generate trend signal
-            trend_signal = generate_trend_signal(
-                ohlcv_data=ohlcv_1h,
-                current_price=current_price,
-                atr_14=atr_14,
-                volume_profile=volume_profile,
-                order_flow=order_flow,
-                liquidity=liquidity
-            )
-
-            # Convert trend signal to TradingRecommendation
-            if trend_signal.recommendation == 'BUY':
-                action = 'buy'
-                position_size = 10.0  # Larger size for trend trades
-            elif trend_signal.recommendation == 'SELL':
-                action = 'sell'
-                position_size = 10.0
-            else:
-                action = 'hold'
-                position_size = 0.0
-
-            # Map confidence to level
-            if trend_signal.confidence >= 70:
-                confidence_level = 'HIGH'
-            elif trend_signal.confidence >= 50:
-                confidence_level = 'MEDIUM'
-            else:
-                confidence_level = 'LOW'
-
-            recommendation = TradingRecommendation(
-                action=action,
-                confidence=float(trend_signal.confidence),
-                entry_price=trend_signal.entry_price,
-                stop_loss=trend_signal.stop_loss if action != 'hold' else None,
-                take_profit=trend_signal.take_profit if action != 'hold' else None,
-                position_size_percentage=position_size,
-                reasoning=f"TRENDING REGIME ({reason}): {trend_signal.reason} - R/R: {trend_signal.risk_reward:.2f}:1 (Chandelier stops)"
-            )
-
-            if action != 'hold':
-                print(f"    ✅ TREND SIGNAL: {trend_signal.recommendation} (confidence: {trend_signal.confidence}%)")
-                print(f"    📊 R/R: {trend_signal.risk_reward:.2f}:1 (Chandelier stops)")
-
-            bounce_pattern = {"pattern": "none"}
-            sentiment = SentimentAnalysis(
-                sentiment='neutral',
-                confidence=50.0,
-                key_points=[],
-                reasoning='Trending regime - using trend following system'
-            )
-
-        elif trading_mode == 'hold':
-            # LOW_VOL REGIME - Mostly hold
-            print(f"    😴 LOW VOLATILITY - Waiting for setup")
-
-            recommendation = TradingRecommendation(
-                action='hold',
-                confidence=60.0,
-                entry_price=current_price,
-                stop_loss=None,
-                take_profit=None,
-                position_size_percentage=0.0,
-                reasoning=f"LOW_VOL REGIME ({reason}): Low volatility environment. Waiting for clearer setup."
-            )
-
-            bounce_pattern = {"pattern": "none"}
-            sentiment = SentimentAnalysis(
-                sentiment='neutral',
-                confidence=50.0,
-                key_points=[],
-                reasoning='Low volatility regime - waiting for setup'
-            )
-
-        else:
-            # CHOPPY REGIME (trading_mode == 'volume_blocking')
-            # Continue with existing pattern detection, volume blocking, etc.
-            print(f"    📊 CHOPPY REGIME - Using pattern detection + volume blocking")
-
-            # === PRIORITY 2: BOUNCE PATTERN DETECTION ===
-            # Detect bounce patterns (runs only if liquidity sweep didn't trigger)
-            print(f"    Detecting bounce patterns (Wyckoff + MA + Volume)...")
+            # Fall back to existing pattern detection system
+            print("    Detecting bounce patterns (Wyckoff + MA + Volume)...")
             bounce_pattern = advisor.detect_bounce_patterns(market_data)
+
             if bounce_pattern["pattern"] != "none":
-                print(f"      🚨 BOUNCE PATTERN: {bounce_pattern['pattern'].upper()} - {bounce_pattern['signal']}")
+                print(f"    🚨 BOUNCE PATTERN: {bounce_pattern['pattern'].upper()} - {bounce_pattern['signal']}")
 
             # Create neutral sentiment (no historical news available)
             sentiment = SentimentAnalysis(
@@ -880,10 +745,8 @@ class BacktestRunner:
                 reasoning='Backtest mode: Using technical indicators and Wyckoff patterns only'
             )
 
-            # === PRIORITY 3: AI RECOMMENDATION ===
-            # Use REAL BitcoinTradingAdvisor to generate recommendation
-            print(f"    Generating recommendation using real AI system...")
-
+            # Generate AI recommendation
+            print("    Generating recommendation using real AI system...")
             try:
                 recommendation = advisor.generate_recommendation(
                     sentiment=sentiment,
@@ -895,10 +758,61 @@ class BacktestRunner:
             except Exception as e:
                 print(f"    ⚠️  AI generation failed: {e}")
                 print(f"    Using fallback technical-only mode")
-                # If AI fails, create a basic recommendation from market data
                 recommendation = self._create_fallback_recommendation(
                     current_price, market_data, portfolio_value, risk_tolerance
                 )
+
+        # Otherwise use signal from decision matrix
+        else:
+            # Map signal to action
+            if signal == 'BUY':
+                action = 'buy'
+            elif signal == 'SELL':
+                action = 'sell'
+            else:
+                action = 'hold'
+
+            # Map confidence to level
+            if signal_confidence >= 70:
+                confidence_level = 'HIGH'
+            elif signal_confidence >= 50:
+                confidence_level = 'MEDIUM'
+            else:
+                confidence_level = 'LOW'
+
+            # Calculate stop/target based on signal
+            if signal == 'BUY':
+                # Use ATR-based stops
+                stop_loss_price = current_price - (market_data.atr_14 * 2)
+                take_profit_price = current_price + (market_data.atr_14 * 3)
+                position_size = 10.0
+            elif signal == 'SELL':
+                stop_loss_price = current_price + (market_data.atr_14 * 2)
+                take_profit_price = current_price - (market_data.atr_14 * 3)
+                position_size = 10.0
+            else:  # HOLD
+                stop_loss_price = None
+                take_profit_price = None
+                position_size = 0.0
+
+            recommendation = TradingRecommendation(
+                action=action,
+                confidence=float(signal_confidence),
+                entry_price=current_price,
+                stop_loss=stop_loss_price,
+                take_profit=take_profit_price,
+                position_size_percentage=position_size,
+                reasoning=f"REGIME: {regime} | {reason}"
+            )
+
+            # Set dummy bounce pattern and sentiment for validation
+            bounce_pattern = {"pattern": "none"}
+            sentiment = SentimentAnalysis(
+                sentiment='neutral',
+                confidence=50.0,
+                key_points=[],
+                reasoning='Decision matrix signal'
+            )
 
         # Store bounce pattern and reversal signal in market_data for validation
         market_data.bounce_pattern = bounce_pattern
