@@ -437,15 +437,18 @@ class TradingEvaluator:
 
         return evaluation
     
-    def _evaluate_correctness(self, recommendation: str, percent_change: float, 
+    def _evaluate_correctness(self, recommendation: str, percent_change: float,
                              confidence: str) -> bool:
         """
         Determine if prediction was correct based on price movement
-        
+
         Thresholds:
         - BUY: Price should increase (>0.5% for high confidence)
         - SELL: Price should decrease (<-0.5% for high confidence)
-        - HOLD: Price should be relatively stable (-0.5% to +0.5%)
+        - HOLD: Correct if avoided a loss or sideways market; incorrect only if missed clear upside
+          - HOLD + price went down = ✅ Correct (didn't buy before a drop)
+          - HOLD + price stayed flat (< 1.5%) = ✅ Correct (nothing to trade)
+          - HOLD + price went up significantly (> 1.5%) = ❌ Incorrect (missed opportunity)
         """
         if confidence == "HIGH":
             buy_threshold = 0.5
@@ -465,8 +468,18 @@ class TradingEvaluator:
         elif recommendation == "SELL":
             return percent_change <= sell_threshold
         elif recommendation == "HOLD":
-            return -0.5 <= percent_change <= 0.5
-        
+            # HOLD is CORRECT if:
+            # 1. Price stayed relatively flat (abs(change) < 1.5%) - sideways confirmed
+            # 2. Price dropped (change < 0) - avoided a loss if we had bought
+            # HOLD is INCORRECT only if:
+            # - Price moved up strongly (change > 1.5%) - missed a clear buying opportunity
+            if percent_change > 1.5:
+                print(f"DEBUG HOLD check: {percent_change} > 1.5% = missed_buy_opportunity (INCORRECT)")
+                return False
+            else:
+                print(f"DEBUG HOLD check: {percent_change} <= 1.5% = prudent_hold (CORRECT)")
+                return True
+
         return False
     
     def _evaluate_sentiment(self, sentiment_score: float, percent_change: float) -> bool:

@@ -76,8 +76,9 @@ class MarketData:
     sma_20: Optional[float]
     sma_50: Optional[float]
     ema_9: Optional[float]
-    price_vs_sma20: Optional[str]  # "above" or "below"
-    price_vs_sma50: Optional[str]  # "above" or "below"
+    atr_14: Optional[float] = None  # Average True Range (14-period)
+    price_vs_sma20: Optional[str] = None  # "above" or "below"
+    price_vs_sma50: Optional[str] = None  # "above" or "below"
     # Liquidity zone analysis
     nearest_support: Optional[float] = None
     nearest_resistance: Optional[float] = None

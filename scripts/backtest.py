@@ -652,6 +652,7 @@ class BacktestRunner:
             sma_20=sma_20,
             sma_50=sma_50,
             ema_9=ema_9,
+            atr_14=atr_14,
             price_vs_sma20=price_vs_sma20,
             price_vs_sma50=price_vs_sma50,
             nearest_support=liquidity_analysis.get('nearest_support'),
